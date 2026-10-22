@@ -161,6 +161,19 @@ class WebUITests(unittest.TestCase):
         with webui._jobs_lock:
             self.assertEqual(webui._jobs[job["id"]]["status"], "queued")
 
+    def test_open_folder_uses_cross_platform_helper(self):
+        with mock.patch.object(webui.core, "open_in_file_manager", return_value=True) as fn:
+            status, data = self.post("/api/open-folder", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        fn.assert_called_once()
+
+    def test_open_folder_reports_failure(self):
+        with mock.patch.object(webui.core, "open_in_file_manager", return_value=False):
+            status, data = self.post("/api/open-folder", {})
+        self.assertEqual(status, 500)
+        self.assertIn("error", data)
+
     # -- 下载落盘 -------------------------------------------------------- #
     def test_download_job_writes_video(self):
         payload = b"fake-mp4" * 100

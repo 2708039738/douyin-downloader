@@ -203,6 +203,15 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(core.download_stream(base + "/v.mp4", path), 30)
             self.assertTrue(os.path.exists(path))
 
+    def test_download_stream_removes_partial_file_on_disconnect(self):
+        # 服务器说好 1000 字节，只发 100 就断开：必须报错，且不能留下坏文件
+        with tempfile.TemporaryDirectory() as tmp, \
+                LocalServer({"/v.mp4": b"x" * 1000}, truncate_at=100) as base:
+            path = os.path.join(tmp, "v.mp4")
+            with self.assertRaises(core.BrowserError):
+                core.download_stream(base + "/v.mp4", path)
+            self.assertFalse(os.path.exists(path), "半截文件应该被删掉")
+
     def test_download_gallery_packs_zip_and_skips_broken_images(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 LocalServer({"/1.jpg": b"one", "/2.jpg": b"two"}) as base:
@@ -252,6 +261,33 @@ class DownloadTests(unittest.TestCase):
             info = core.describe(make_aweme())
             info["cover_url"] = "http://127.0.0.1:1/nope.jpg"
             self.assertIsNone(core.save_cover(info, tmp))
+
+
+class OpenInFileManagerTests(unittest.TestCase):
+    """「打开文件夹」在三个系统上要用各自的原生命令。"""
+
+    def test_windows_uses_startfile(self):
+        with mock.patch("core.sys.platform", "win32"), \
+                mock.patch.object(core.os, "startfile", create=True) as startfile:
+            self.assertTrue(core.open_in_file_manager(r"C:\downloads"))
+        startfile.assert_called_once_with(r"C:\downloads")
+
+    def test_macos_uses_open(self):
+        with mock.patch("core.sys.platform", "darwin"), \
+                mock.patch.object(core.subprocess, "Popen") as popen:
+            self.assertTrue(core.open_in_file_manager("/tmp/downloads"))
+        popen.assert_called_once_with(["open", "/tmp/downloads"])
+
+    def test_linux_uses_xdg_open(self):
+        with mock.patch("core.sys.platform", "linux"), \
+                mock.patch.object(core.subprocess, "Popen") as popen:
+            self.assertTrue(core.open_in_file_manager("/tmp/downloads"))
+        popen.assert_called_once_with(["xdg-open", "/tmp/downloads"])
+
+    def test_failure_returns_false(self):
+        with mock.patch("core.sys.platform", "linux"), \
+                mock.patch.object(core.subprocess, "Popen", side_effect=OSError):
+            self.assertFalse(core.open_in_file_manager("/tmp/downloads"))
 
 
 class FfmpegTests(unittest.TestCase):

@@ -254,11 +254,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"created": created})
             return
         if path == "/api/open-folder":
-            try:
-                os.startfile(DOWNLOAD_DIR)  # noqa: S606
+            if core.open_in_file_manager(DOWNLOAD_DIR):
                 self._json({"ok": True})
-            except Exception as e:  # noqa: BLE001
-                self._json({"error": str(e)}, 500)
+            else:
+                self._json({"error": "打不开文件管理器，请手动打开 downloads 文件夹"}, 500)
             return
         if path == "/api/retry":
             jid = str(self._read_json().get("id") or "")
@@ -301,12 +300,6 @@ def open_browser(url):
             return True
     except Exception:
         pass
-    try:
-        if hasattr(os, "startfile"):
-            os.startfile(url)  # noqa: S606
-            return True
-    except Exception:
-        pass
     exe = core.find_browser()
     if exe:
         try:
@@ -314,11 +307,7 @@ def open_browser(url):
             return True
         except Exception:
             pass
-    try:
-        subprocess.Popen(["cmd", "/c", "start", "", url])
-        return True
-    except Exception:
-        return False
+    return core.open_in_file_manager(url)
 
 
 def _console_commands(url):
