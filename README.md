@@ -10,6 +10,22 @@
 - **提取 MP3**：有 ffmpeg 就从视频音轨转；没有就退而求其次下抖音原声
 - 纯 Python 标准库，**不需要 pip 安装任何东西**
 
+## 需要什么
+
+| 依赖 | 必需 | 说明 |
+| --- | --- | --- |
+| Python 3.9+ | 是 | 安装时勾选 "Add Python to PATH" |
+| Edge 或 Chrome | 是 | 程序起一个无头浏览器，让抖音自己的 JS 去算签名；没有就拿不到视频地址 |
+| ffmpeg | 否 | 只有「提取 MP3」要用。没有就退化成下载抖音原声（背景音乐） |
+| 能上 douyin.com 的网络 | 是 | 系统代理会自动继承 |
+
+**pip 包一个都不用**：下载走 `urllib`，DevTools 协议用的是手写的 WebSocket 客户端，
+网页版用 `http.server`，全部标准库实现。所以没有 `requirements.txt` 这回事，
+也不用建虚拟环境。
+
+拿不准环境够不够，双击 **`环境检查.bat`**（等同 `python app.py --checkenv`），
+它会逐项报告 Python 版本、浏览器、ffmpeg、网络，并告诉你缺的是必需项还是可选项。
+
 ## 怎么用
 
 ### 拖拽（推荐）
@@ -39,6 +55,7 @@ python app.py 链接 --audio --meta                  # 顺便 MP3 + 封面文案
 python app.py https://www.douyin.com/user/xxxx --max 20    # 主页前 20 个
 python app.py 链接列表.txt                          # 从 txt 批量读链接
 python app.py --ui                                 # 打开网页版界面
+python app.py --checkenv                           # 检查依赖是否齐全
 ```
 
 完整参数看 `python app.py -h`。

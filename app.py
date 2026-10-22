@@ -7,12 +7,14 @@
     或者：python app.py https://v.douyin.com/xxxx/
 
     python app.py --ui        打开网页版界面
+    python app.py --checkenv  检查依赖是否齐全
 """
 
 import argparse
 import atexit
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -436,6 +438,67 @@ def run(args):
         browser.close()
 
 
+# --------------------------------------------------------------------------- #
+# 环境检查
+# --------------------------------------------------------------------------- #
+def can_reach(host, port, timeout=4):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def check_env(args):
+    """逐项报告运行依赖：Python 版本、浏览器、ffmpeg、网络。"""
+    print()
+    line()
+    print("  环境检查")
+    line()
+
+    issues = 0
+
+    ver = "%d.%d.%d" % sys.version_info[:3]
+    ok = sys.version_info >= (3, 9)
+    print("  %s Python %s%s" % (
+        c("[OK]  ", "92") if ok else c("[缺少]", "91"),
+        ver,
+        "" if ok else c("   需要 3.9 或更新", "93")))
+    if not ok:
+        issues += 1
+
+    print("  %s pip 依赖：不需要，全部用标准库" % c("[OK]  ", "92"))
+
+    browser = core.find_browser()
+    if browser:
+        print("  %s 浏览器：%s" % (c("[OK]  ", "92"), browser))
+    else:
+        print("  %s 浏览器：没找到 Edge / Chrome，拿不到视频地址"
+              % c("[缺少]", "91"))
+        issues += 1
+
+    ffmpeg = core.find_ffmpeg(getattr(args, "ffmpeg", None))
+    if ffmpeg:
+        print("  %s ffmpeg：%s" % (c("[OK]  ", "92"), ffmpeg))
+    else:
+        print("  %s ffmpeg：没找到，只有「提取 MP3」用不了，其他功能正常"
+              % c("[可选]", "93"))
+
+    if can_reach("www.douyin.com", 443):
+        print("  %s 网络：能连上 www.douyin.com" % c("[OK]  ", "92"))
+    else:
+        print("  %s 网络：连不上 www.douyin.com，检查网络或代理"
+              % c("[可选]", "93"))
+
+    line()
+    if issues:
+        print(c("  有 %d 项必需依赖没满足，先补齐再用。" % issues, "91"))
+    else:
+        print(c("  必需依赖齐全，可以直接用。", "92"))
+    print()
+    return 1 if issues else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="抖音视频下载器：粘链接就能下，可选带/不带水印",
@@ -457,7 +520,12 @@ def main():
     parser.add_argument("--ui", action="store_true", help="打开网页版界面")
     parser.add_argument("--cleanup", action="store_true",
                         help="清理上次被强杀后残留的无头浏览器，然后退出")
+    parser.add_argument("--checkenv", action="store_true",
+                        help="检查运行依赖（Python / 浏览器 / ffmpeg / 网络），然后退出")
     args = parser.parse_args()
+
+    if args.checkenv:
+        return check_env(args)
 
     if args.cleanup:
         core.kill_stale_browser()
