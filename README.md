@@ -149,6 +149,17 @@ python app.py --checkenv                           # 检查依赖是否齐全
 装个 ffmpeg 并加进 PATH，或者用 `--ffmpeg D:\ffmpeg\bin\ffmpeg.exe` 指过去。
 没有也能用：程序会改成下载抖音原声（背景音乐，可能不含人声）。
 
+**网页版下完只有 mp4，没有封面/文案/MP3？**
+现在两个入口的行为是一致的：封面和文案跟着 `save_meta`，MP3 跟着 `save_audio`。
+如果你的 `config.json` 里 `save_audio` 是 `false`，网页版也不会提取 MP3。
+想让网页版换目录，写 `"out": "D:\\某目录"`，不用每次开命令行加 `--out`。
+
+**macOS / Linux 上清理残留浏览器会不会误杀别的程序？**
+不会。清理前会先用 `ps` 查这个 pid 到底是什么进程，名字里得有
+`chrome` / `chromium` / `msedge` 才动手；查不到名字就不杀。
+Windows 上同理，走 `tasklist /FI "PID eq N"` 并按列精确匹配 pid
+（不能只看「输出里有没有这个数字」，内存占用栏里也可能出现同样的数字）。
+
 **带水印的为什么只有 720P**
 抖音官方下载接口本身只给 720P 带水印版，不是程序限制。
 
