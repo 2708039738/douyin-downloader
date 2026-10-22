@@ -46,6 +46,9 @@
 那个黑窗口要一直开着，关掉就等于退出；页面右上角有「服务已连接」的指示灯，
 显示「未连接」说明窗口被关了，重新双击 `网页版.bat` 再刷新页面。
 
+网页版和命令行走的是同一套下载逻辑：`config.json` 里的清晰度、`save_meta`、
+`save_audio`、`out` 都对它生效；主页链接会自动拆成一个个作品排进队列。
+
 ### 命令行
 
 ```bash
@@ -64,7 +67,8 @@ python app.py --checkenv                           # 检查依赖是否齐全
 
 ## 文件去哪了
 
-默认在程序目录的 `downloads/`，可以用 `--out D:\某目录` 改。
+默认在程序目录的 `downloads/`，可以用 `--out D:\某目录` 改，
+或者在 `config.json` 里写 `"out": "D:\\某目录"`（网页版也认这一项）。
 
 每个作品会存成：
 
@@ -88,9 +92,12 @@ python app.py --checkenv                           # 检查依赖是否齐全
   "prefer_h264": true,      // 优先 H.264，兼容性最好
   "save_meta": true,        // 保存封面 + 文案
   "save_audio": false,      // 顺便提取 MP3
-  "profile_limit": 20       // 主页链接最多取几个作品
+  "profile_limit": 20,      // 主页链接最多取几个作品
+  "out": ""                 // 下载目录，留空就是 downloads
 }
 ```
+
+改完不用重启，下一次任务就会用新值（网页版每次任务前会重新读一遍）。
 
 删掉这个文件，下次运行会重新问一遍。
 
@@ -157,8 +164,11 @@ python app.py --checkenv                           # 检查依赖是否齐全
 python -m unittest discover -v
 ```
 
-- 不联网、不打开抖音、不需要 pip 安装，几秒跑完
-- 覆盖链接解析、清晰度选择、下载（含半路断线）、图集打包、网页版接口、配置读写
+- 113 个用例，不联网、不打开抖音、不需要 pip 安装，十几秒跑完
+- 覆盖链接解析、清晰度选择、下载（含半路断线 / 谎报长度 / 空响应）、图集打包、
+  文案封面落盘、网页版接口、配置读写
+- `tests/test_adversarial.py` 专门从攻击者角度写：伪造 `Host` / `Origin` 的十几种绕过写法、
+  PID 复用时的误杀、畸形 `Content-Length`、任务 id 并发撞号、路径穿越
 - 每次 push / PR 会自动在 **Windows / macOS / Linux × Python 3.9 / 3.11 / 3.13** 上跑一遍，
   配置在 `.github/workflows/ci.yml`
 
@@ -168,3 +178,12 @@ python -m unittest discover -v
 
 只适合个人学习和备份自己的素材。别人的作品请先取得授权，
 不要拿去搬运、二次发布或商用。
+
+本项目与抖音官方无关，用的是本机浏览器里已经登录的会话，不提供任何破解能力。
+
+**支持范围**：主要在 Windows 10/11 上开发和测试；macOS / Linux 能跑
+（浏览器路径、打开文件夹、清理进程都做了兼容），但没有充分验证，遇到问题欢迎提 issue。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。
