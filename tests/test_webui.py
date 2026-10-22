@@ -90,6 +90,55 @@ class WebUITests(unittest.TestCase):
         status, _, _ = self.get("/nope")
         self.assertEqual(status, 404)
 
+    # -- 只服务本机页面 -------------------------------------------------- #
+    def test_rejects_foreign_host_header(self):
+        """DNS rebinding：别的域名解析到 127.0.0.1 也不能用。"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest("GET", "/api/jobs", skip_host=True)
+        conn.putheader("Host", "attacker.example")
+        conn.endheaders()
+        resp = conn.getresponse()
+        try:
+            self.assertEqual(resp.status, 403)
+        finally:
+            resp.read()
+            conn.close()
+
+    def test_allows_localhost_host_header(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest("GET", "/api/jobs", skip_host=True)
+        conn.putheader("Host", "localhost:%d" % self.port)
+        conn.endheaders()
+        resp = conn.getresponse()
+        try:
+            self.assertEqual(resp.status, 200)
+        finally:
+            resp.read()
+            conn.close()
+
+    def test_rejects_post_from_another_site(self):
+        """你打开的任何网页都可能偷偷 POST 过来，所以要看 Origin。"""
+        status, data = self.post(
+            "/api/parse",
+            {"text": "https://www.douyin.com/video/7123456789012345678"},
+            headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertIn("error", data)
+        with webui._jobs_lock:
+            self.assertEqual(len(webui._jobs), 0)
+
+    def test_rejects_get_from_another_site(self):
+        status, _, _ = self.get("/api/jobs", headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_allows_same_origin_post(self):
+        status, data = self.post(
+            "/api/parse",
+            {"text": "https://www.douyin.com/video/7123456789012345678"},
+            headers={"Origin": "http://127.0.0.1:%d" % self.port})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["created"]), 1)
+
     # -- 解析接口 -------------------------------------------------------- #
     def test_parse_rejects_text_without_douyin_link(self):
         status, data = self.post("/api/parse", {"text": "没有链接"})

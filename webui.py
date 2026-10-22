@@ -155,8 +155,38 @@ def _download_job(job_id, info):
 class Handler(BaseHTTPRequestHandler):
     server_version = "DouyinDL/1.0"
 
+    # 只认本机地址。别的网站即使把域名解析到 127.0.0.1（DNS rebinding），
+    # 它发来的 Host 也是自己的域名，会被这里挡掉。
+    _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
     def log_message(self, fmt, *args):
         pass
+
+    def _host_ok(self):
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):            # [::1]:8765
+            host = host[1:].split("]", 1)[0]
+        elif host.count(":") == 1:          # 127.0.0.1:8765
+            host = host.split(":", 1)[0]
+        return host in self._LOCAL_HOSTS
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True                     # 命令行 / 脚本本来就不带 Origin
+        parsed = urllib.parse.urlparse(origin)
+        return parsed.scheme == "http" and (parsed.hostname or "") in self._LOCAL_HOSTS
+
+    def _reject_foreign(self):
+        """不是本机页面发来的请求，就拒绝。
+
+        为什么需要：本地服务没有密码，任何网页都能往 127.0.0.1:8765 发请求。
+        不加判断的话，你随便打开一个网站，它就能偷偷加下载任务、删你的文件。
+        """
+        if self._host_ok() and self._origin_ok():
+            return False
+        self._json({"error": "只接受本机页面发来的请求"}, 403)
+        return True
 
     def _send(self, code, body=b"", ctype="application/json; charset=utf-8", cache=None):
         if isinstance(body, str):
@@ -205,6 +235,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
     def do_GET(self):
+        if self._reject_foreign():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -236,6 +268,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
+        if self._reject_foreign():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/parse":
             data = self._read_json()
