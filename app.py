@@ -15,9 +15,7 @@ import atexit
 import json
 import os
 import socket
-import subprocess
 import sys
-import threading
 import time
 
 import core
@@ -428,10 +426,8 @@ def run(args):
         print("\n完成：%d 个文件，保存到" % len(ok_files))
         print("  %s" % folder)
         if ok_files and args.open_folder:
-            try:
-                os.startfile(folder)  # noqa: S606
-            except Exception:
-                pass
+            if not core.open_in_file_manager(folder):
+                print(c("  打不开文件管理器，请手动打开：%s" % folder, "33"))
         return 0
 
     finally:

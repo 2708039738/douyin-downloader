@@ -1,43 +1,62 @@
 name: CI
 
+# 什么时候跑：每次 push、每个 PR、也可以手动点一下
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# 同一个分支连续 push 时，取消上一轮还没跑完的，省时间
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
-    name: py${{ matrix.python }} @ ${{ matrix.os }}
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
-      fail-fast: false
+      fail-fast: false  # 一个平台挂了，其他平台照样跑完，方便对照
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        python:
+          - "3.9"
+          - "3.11"
+          - "3.13"
     env:
+      # 三个平台的终端编码不一致，统一成 UTF-8，免得中文输出把 Windows 上的测试搞崩
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
+      - name: 显示版本
+        run: python -V
+
       # 项目零第三方依赖，所以这里没有 pip install 这一步
-      - name: 编译检查
+      - name: 语法检查（三个入口文件能被解析）
         run: python -m compileall -q app.py core.py webui.py tests
 
-      - name: 冒烟测试
-        run: |
-          python -c "import app, core, webui"
-          python app.py -h
+      - name: 导入冒烟
+        run: python -c "import app, core, webui"
 
       - name: 单元测试
+        # 不联网、不开浏览器，Windows / macOS / Linux 跑的是同一套
         run: python -m unittest discover -s tests -v
+
+      - name: 命令行入口能正常启动
+        run: python app.py --help

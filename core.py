@@ -296,6 +296,24 @@ def find_browser():
     return None
 
 
+def open_in_file_manager(path):
+    """用系统自带的文件管理器打开目录（或链接），返回是否成功。
+
+    Windows 用 os.startfile，macOS 用 open，Linux 用 xdg-open。
+    这三个命令都是系统自带的，不需要装东西。
+    """
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # 浏览器（拿签名数据）
 # --------------------------------------------------------------------------- #
@@ -770,19 +788,34 @@ HEADERS = {
 
 
 def download_stream(url, path, on_progress=None, timeout=60, headers=None):
+    """把 url 下载到 path。
+
+    下载中断（断网、服务器提前断开）时抛 BrowserError，并把半截文件删掉，
+    避免留下一个「看起来下载成功、其实放不了」的坏文件。
+    """
     req = urllib.request.Request(url, headers=headers or HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as r, open(path, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        got = 0
-        while True:
-            chunk = r.read(1 << 16)
-            if not chunk:
-                break
-            f.write(chunk)
-            got += len(chunk)
-            if on_progress:
-                on_progress(got, total)
-    return got
+    got = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(path, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if on_progress:
+                    on_progress(got, total)
+        if total and got != total:
+            raise BrowserError("下载不完整：只拿到 %d / %d 字节，已删除半截文件，请重试"
+                               % (got, total))
+        return got
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
 
 
 def unique_path(folder, base, ext):
