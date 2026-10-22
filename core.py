@@ -53,6 +53,55 @@ URL_RE = re.compile(r"https?://[^\s\u4e00-\u9fa5\"'<>，。、；：！？）】
 ID_RE = re.compile(r"(?:/video/|/note/|/share/video/|/share/note/|modal_id=|item_ids=|/slides/)(\d{15,25})")
 USER_RE = re.compile(r"douyin\.com/user/([A-Za-z0-9_\-]+)")
 
+# 清理残留进程时，只认这些名字里带的浏览器。名字对不上就不杀，
+# 免得 PID 被系统复用以后误杀你别的程序（issue #3）。
+BROWSER_KEYWORDS = ("msedge", "chrome", "chromium", "microsoft edge", "google chrome")
+
+
+# --------------------------------------------------------------------------- #
+# 配置（命令行和网页版共用一份，别再各写一遍）
+# --------------------------------------------------------------------------- #
+DEFAULT_CONFIG = {
+    "quality": "auto",       # auto / 1080 / 720 / 540
+    "prefer_h264": True,     # 优先 H.264，兼容性最好
+    "save_meta": True,       # 保存封面 + 文案
+    "save_audio": False,     # 顺便提取 MP3
+    "profile_limit": 20,     # 主页链接最多取多少个作品
+    "out": "",               # 下载目录，留空就是程序目录下的 downloads
+}
+
+
+def load_config(path, wizard=None):
+    """读 config.json，缺的字段用默认值补上。
+
+    - 文件不存在 / 读坏了：有 wizard 就调它（首次运行的问答），没有就直接用默认值
+    - 网页版传 wizard=None，这样它永远能起来，不会卡在等输入
+    """
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = dict(DEFAULT_CONFIG)
+                cfg.update(json.load(f))
+                return cfg
+        except Exception:
+            pass
+    if wizard is not None:
+        return wizard()
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(path, cfg):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def config_output_dir(base_dir, cfg, override=None, default=None):
+    """决定下载到哪个目录：命令行 --out > config 里的 out > 默认目录。"""
+    raw = (override or (cfg or {}).get("out") or "").strip()
+    if not raw:
+        return default or os.path.join(base_dir, "downloads")
+    return raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
+
 
 # --------------------------------------------------------------------------- #
 # 链接处理
@@ -241,10 +290,57 @@ def _pid_file():
     return os.path.join(tempfile.gettempdir(), "dydl_browser.pid")
 
 
+def _parse_tasklist(text, pid):
+    """从 tasklist 的输出里挑出 pid 那一行的进程名，挑不出来返回空串。
+
+    匹配方式按「第二列必须正好等于 pid」来，不能直接 `pid in text`——
+    内存占用里也可能出现同样的数字。
+    """
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) == pid:
+            return parts[0].lower()
+    return ""
+
+
+def _process_name(pid):
+    """拿到 pid 对应的进程名（小写）。拿不到就返回空串，调用方据此「不杀」。"""
+    try:
+        if sys.platform == "win32":
+            listed = subprocess.run(
+                ["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=0x08000000, timeout=10)
+            return _parse_tasklist(listed.stdout.decode("latin-1", "ignore"), pid)
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=5)
+        return out.stdout.decode("utf-8", "ignore").strip().lower()
+    except Exception:
+        return ""
+
+
+def _looks_like_browser(name):
+    name = (name or "").lower()
+    return bool(name) and any(k in name for k in BROWSER_KEYWORDS)
+
+
+def _kill_pid(pid):
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=0x08000000, timeout=10)
+    else:
+        os.kill(pid, 15)
+
+
 def kill_stale_browser():
     """
-    上次如果被强杀，无头浏览器会留在后台。只用 tasklist / taskkill，
-    比拉一个 PowerShell 起来快得多，也不容易被杀软盯上。
+    上次如果被强杀，无头浏览器会留在后台。
+
+    Windows 用 tasklist / taskkill，其他系统用 ps / kill。
+    两边都先确认「这个 pid 真的是浏览器」再动手——pid 会被系统复用，
+    直接 kill 有可能打到你自己刚开的程序上。
     """
     path = _pid_file()
     if not os.path.isfile(path):
@@ -264,18 +360,11 @@ def kill_stale_browser():
     try:
         if not pid:
             return
-        if sys.platform == "win32":
-            flags = 0x08000000
-            listed = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    creationflags=flags, timeout=10)
-            text = listed.stdout.decode("latin-1", "ignore").lower()
-            if "msedge" in text or "chrome" in text:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=flags, timeout=10)
-        else:
-            os.kill(pid, 15)
+        name = _process_name(pid)
+        if not _looks_like_browser(name):
+            # 拿不到名字（没 ps）或者名字对不上，一律不杀
+            return
+        _kill_pid(pid)
     except Exception:
         pass
     finally:
@@ -806,6 +895,9 @@ def download_stream(url, path, on_progress=None, timeout=60, headers=None):
                 got += len(chunk)
                 if on_progress:
                     on_progress(got, total)
+        if not got:
+            # 有的服务器回 200 却一个字节都不给，这种也算失败
+            raise BrowserError("下载到的内容是空的（0 字节），请重试")
         if total and got != total:
             raise BrowserError("下载不完整：只拿到 %d / %d 字节，已删除半截文件，请重试"
                                % (got, total))
@@ -912,6 +1004,29 @@ def save_cover(info, folder):
     return path
 
 
+def save_extras(info, folder, with_meta=True):
+    """保存文案 + 封面，返回真正写出来的文件列表。
+
+    命令行和网页版都调这一个，免得两边存的東西不一样（issue #5）。
+    任何一项失败都不影响另一项：视频已经下好了，附属文件不该把整个任务判死。
+    """
+    out = []
+    if not with_meta:
+        return out
+    if info.get("base") and isinstance(info.get("stats"), dict):
+        try:
+            out.append(save_meta(info, folder))
+        except Exception:
+            pass
+    try:
+        cover = save_cover(info, folder)
+        if cover:
+            out.append(cover)
+    except Exception:
+        pass
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # 提取音频
 # --------------------------------------------------------------------------- #
@@ -944,3 +1059,31 @@ def extract_mp3(video_path, out_path, ffmpeg, bitrate="192k"):
     if proc.returncode != 0 or not os.path.exists(out_path):
         raise BrowserError("ffmpeg 转换失败：%s" % proc.stderr.decode("utf-8", "ignore")[-160:])
     return out_path
+
+
+def save_audio(info, video_path, folder, ffmpeg=None):
+    """保存音频，返回 [(路径, 说明), ...]，拿不到就返回空列表。
+
+    优先用 ffmpeg 从视频里抽音轨；没有 ffmpeg 就退回下载抖音的原始音频。
+    命令行和网页版共用这一份逻辑（issue #5）。
+    """
+    if not info.get("base"):
+        return []
+    if ffmpeg:
+        target = unique_path(folder, info["base"] + "[音频]", "mp3")
+        try:
+            extract_mp3(video_path, target, ffmpeg)
+            return [(target, "从视频音轨转的")]
+        except Exception:
+            pass
+
+    music = info.get("music")
+    if music:
+        ext = "mp3" if ".mp3" in music.lower() else "m4a"
+        target = unique_path(folder, info["base"] + "[原声]", ext)
+        try:
+            download_stream(music, target, timeout=45)
+            return [(target, "原声替代，装个 ffmpeg 就能从视频里抽音轨")]
+        except Exception:
+            pass
+    return []

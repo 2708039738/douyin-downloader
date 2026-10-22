@@ -181,7 +181,7 @@
 
   <footer>
     仅供个人学习与备份使用，请尊重原作者版权，不要用于搬运或商业传播。<br>
-    文件保存在程序目录的 downloads 文件夹里。
+    文件默认保存在程序目录的 downloads 文件夹里（想换地方，改 config.json 的 out）。
   </footer>
 </div>
 <div class="toast" id="toast"></div>
@@ -339,13 +339,18 @@ function updateJob(j) {
   if (j.status === 'queued') text = '排队中';
   else if (j.status === 'parsing') text = '正在解析视频信息…';
   else if (j.status === 'downloading') text = j.speed ? `下载中 ${human(j.speed)}/s` : '下载中…';
-  else if (j.status === 'done') text = '已保存到 downloads';
+  else if (j.status === 'done') {
+    text = j.batch_count ? `已拆成 ${j.batch_count} 个任务`
+         : ((j.saved_to || 'downloads') === 'downloads' ? '已保存到 downloads'
+            : `已保存到 ${j.saved_to}`);
+    if (j.extras && j.extras.length) text += `（另存 ${j.extras.length} 个附属文件）`;
+  }
   else if (j.status === 'error') text = j.error;
   set('status', text);
 
   const acts = el.querySelector('[data-f="acts"]');
   let html = '';
-  if (j.status === 'done') {
+  if (j.status === 'done' && j.filename) {
     html += `<a class="mini pri" href="/api/file?id=${j.id}">另存为</a>`;
   }
   if (j.status === 'error') {
@@ -379,11 +384,23 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
+// ---- 用 config.json 里的默认值初始化表单 ----
+async function loadDefaults() {
+  try {
+    const r = await fetch('/api/config');
+    const c = await r.json();
+    const sel = $('#quality');
+    if (c.quality && [...sel.options].some(o => o.value === c.quality)) sel.value = c.quality;
+    if (typeof c.prefer_h264 === 'boolean') $('#h264').checked = c.prefer_h264;
+  } catch (e) { /* 服务还没起来就用页面上的默认值 */ }
+}
+
 // 有任务在跑的时候刷新快一点
 setInterval(() => {
   const busy = jobs.some(j => j.status !== 'done' && j.status !== 'error');
   poll();
 }, 900);
+loadDefaults();
 poll();
 </script>
 </body>

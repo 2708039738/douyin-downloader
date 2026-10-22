@@ -11,7 +11,6 @@ import mimetypes
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -23,7 +22,11 @@ import core
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(BASE_DIR, "web")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+
+# 请求体上限。正常请求只有几百字节，超过这个数一律当成恶意/出错。
+MAX_BODY = 1 << 20
 
 BROWSER = core.Browser(log=lambda m: print("[浏览器] " + m, flush=True))
 
@@ -35,12 +38,35 @@ _queue_lock = threading.Condition()
 _seq = 0
 _thumbs = {}
 
+_cfg_lock = threading.Lock()
+_cfg_cache = (None, None)   # (mtime, cfg)
+
+
+def _config():
+    """读一次 config.json，文件改了就重新读 —— 网页版也能用上清晰度等默认值。"""
+    global _cfg_cache
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        mtime = None
+    with _cfg_lock:
+        if _cfg_cache[1] is None or _cfg_cache[0] != mtime:
+            _cfg_cache = (mtime, core.load_config(CONFIG_PATH))
+        return dict(_cfg_cache[1])
+
+
+def _download_dir(cfg=None):
+    """下载目录：config 里写了 out 就用它，否则程序目录/downloads。"""
+    cfg = _config() if cfg is None else cfg
+    folder = core.config_output_dir(BASE_DIR, cfg, default=DOWNLOAD_DIR)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
 
 def _new_job(url, watermark, quality, prefer_h264=True):
     global _seq
-    _seq += 1
     job = {
-        "id": str(_seq),
+        "id": "",
         "url": url,
         "watermark": bool(watermark),
         "quality": quality or "auto",
@@ -56,10 +82,16 @@ def _new_job(url, watermark, quality, prefer_h264=True):
         "error": "",
         "filename": "",
         "is_gallery": False,
+        "extras": [],
+        "saved_to": "",
+        "batch_count": 0,
         "created": time.time(),
         "finished": 0,
     }
     with _jobs_lock:
+        # 自增必须和插入在同一把锁里：两个请求同时进来不能拿到同一个 id
+        _seq += 1
+        job["id"] = str(_seq)
         _jobs[job["id"]] = job
         _job_order.append(job["id"])
     return job
@@ -81,6 +113,37 @@ def _update(job_id, **kw):
             job.update(kw)
 
 
+def _expand_profile(job_id, target, job, cfg):
+    """主页链接：先把作品列表取出来，再一个一个排进队列。"""
+    _update(job_id, status="parsing", title="主页：正在读取作品列表…")
+    try:
+        limit = int(cfg.get("profile_limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        links = BROWSER.profile_links(target, limit=limit)
+    except Exception as e:  # noqa: BLE001
+        _update(job_id, status="error", error="读取主页失败：%s" % e, finished=time.time())
+        return
+    links = [u for u in (links or []) if u]
+    if not links:
+        _update(job_id, status="error",
+                error="主页里没读到作品（可能需要登录，或者主页不可见）",
+                finished=time.time())
+        return
+    for u in links:
+        child = _new_job(u, job.get("watermark"), job.get("quality"),
+                         job.get("prefer_h264", True))
+        with _queue_lock:
+            _queue.append(child["id"])
+            _queue_lock.notify()
+    # 父任务本身没有文件，只用来告诉界面「拆出了 N 个」
+    _update(job_id, status="done", title="主页：%d 个作品已加入队列" % len(links),
+            batch_count=len(links), received=1, size=1, speed=0, saved_to="",
+            finished=time.time())
+    print("[主页] %d 个作品已加入队列" % len(links))
+
+
 def _resolve_worker():
     while True:
         with _queue_lock:
@@ -91,9 +154,13 @@ def _resolve_worker():
             job = _jobs.get(job_id)
         if not job or job["status"] != "queued":
             continue
+        cfg = _config()
         try:
             _update(job_id, status="parsing")
             target = core.normalize_url(job["url"])
+            if core.is_profile_url(target):
+                _expand_profile(job_id, target, job, cfg)
+                continue
             aweme = BROWSER.detail(target)
             info = core.describe(aweme, watermark=job["watermark"], quality=job["quality"],
                                  prefer_h264=job.get("prefer_h264", True))
@@ -107,7 +174,7 @@ def _resolve_worker():
                     duration=info["duration"], quality_label=info.get("quality_label") or "",
                     size=info.get("size") or 0, filename=info["filename"],
                     is_gallery=info.get("is_gallery", False))
-            threading.Thread(target=_download_job, args=(job_id, info), daemon=True).start()
+            threading.Thread(target=_download_job, args=(job_id, info, cfg), daemon=True).start()
         except core.BrowserError as e:
             _update(job_id, status="error", error=str(e), finished=time.time())
         except Exception as e:  # noqa: BLE001
@@ -115,11 +182,13 @@ def _resolve_worker():
             _update(job_id, status="error", error="解析出错：%s" % e, finished=time.time())
 
 
-def _download_job(job_id, info):
+def _download_job(job_id, info, cfg=None):
     started = time.time()
+    cfg = _config() if cfg is None else cfg
+    folder = _download_dir(cfg)
     try:
         if info["kind"] == "video":
-            path = core.unique_path(DOWNLOAD_DIR, info["filename"], "mp4")
+            path = core.unique_path(folder, info["filename"], "mp4")
 
             def progress(got, total):
                 with _jobs_lock:
@@ -140,12 +209,21 @@ def _download_job(job_id, info):
                         job["received"] = done
                         job["size"] = total
 
-            path = core.download_gallery(info["files"], DOWNLOAD_DIR, info["filename"],
+            path = core.download_gallery(info["files"], folder, info["filename"],
                                          on_progress=progress)
+
+        # 视频下好了再补封面 / 文案 / MP3 —— 和命令行走的是同一套 core 函数
+        extras = core.save_extras(info, folder, with_meta=cfg.get("save_meta", True))
+        if cfg.get("save_audio") and info.get("kind") == "video":
+            for apath, note in core.save_audio(info, path, folder, core.find_ffmpeg()):
+                extras.append(apath)
+                print("[音频] %s（%s）" % (os.path.basename(apath), note))
 
         size = os.path.getsize(path) if os.path.exists(path) else 0
         _update(job_id, status="done", path=path, filename=os.path.basename(path),
-                size=size, received=size, finished=time.time(), speed=0)
+                size=size, received=size, finished=time.time(), speed=0,
+                extras=[os.path.basename(p) for p in extras],
+                saved_to=os.path.basename(folder))
         print("[完成] %s (%.1f MB)" % (os.path.basename(path), size / 1048576.0))
     except Exception as e:  # noqa: BLE001
         print("[失败] 下载出错：%s" % e)
@@ -171,11 +249,27 @@ class Handler(BaseHTTPRequestHandler):
         return host in self._LOCAL_HOSTS
 
     def _origin_ok(self):
-        origin = self.headers.get("Origin")
-        if not origin:
+        # 有的客户端会重复发 Origin，只要有一个不是本机就拒
+        origins = self.headers.get_all("Origin") or []
+        if not origins:
             return True                     # 命令行 / 脚本本来就不带 Origin
-        parsed = urllib.parse.urlparse(origin)
-        return parsed.scheme == "http" and (parsed.hostname or "") in self._LOCAL_HOSTS
+        for origin in origins:
+            parsed = urllib.parse.urlparse(origin or "")
+            if parsed.scheme != "http" or (parsed.hostname or "") not in self._LOCAL_HOSTS:
+                return False
+        return True
+
+    def _drain(self):
+        """把没读的请求体读掉，这样回 403 时连接能干净关闭，客户端不会只看到连接被重置。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return
+        if 0 < length <= MAX_BODY:
+            try:
+                self.rfile.read(length)
+            except Exception:
+                pass
 
     def _reject_foreign(self):
         """不是本机页面发来的请求，就拒绝。
@@ -185,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         if self._host_ok() and self._origin_ok():
             return False
+        self._drain()
         self._json({"error": "只接受本机页面发来的请求"}, 403)
         return True
 
@@ -203,8 +298,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return {}
+        if length <= 0:
+            return {}
+        if length > MAX_BODY:
+            # 别为了一个畸形的 Content-Length 把内存吃光
+            self.close_connection = True
             return {}
         try:
             return json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
@@ -250,6 +352,12 @@ class Handler(BaseHTTPRequestHandler):
                 jobs = [_public(_jobs[i]) for i in _job_order if i in _jobs]
             self._json({"jobs": jobs})
             return
+        if path == "/api/config":
+            # 给前端初始化表单用：网页版也遵守 config.json 里的默认值
+            cfg = _config()
+            self._json({k: cfg.get(k) for k in
+                        ("quality", "prefer_h264", "save_meta", "save_audio", "profile_limit")})
+            return
         if path == "/api/thumb":
             data = _thumbs.get((query.get("id") or [""])[0])
             if not data:
@@ -277,10 +385,13 @@ class Handler(BaseHTTPRequestHandler):
             if not urls:
                 self._json({"error": "没识别到抖音链接"}, 400)
                 return
+            cfg = _config()
+            # 前端没显式指定时，用 config.json 里的默认值（以前网页版完全忽略配置）
+            quality = data.get("quality") or cfg.get("quality") or "auto"
+            prefer_h264 = data.get("prefer_h264", cfg.get("prefer_h264", True))
             created = []
             for u in urls:
-                job = _new_job(u, data.get("watermark"), data.get("quality"),
-                               data.get("prefer_h264", True))
+                job = _new_job(u, data.get("watermark"), quality, prefer_h264)
                 created.append(job["id"])
                 with _queue_lock:
                     _queue.append(job["id"])
@@ -288,10 +399,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"created": created})
             return
         if path == "/api/open-folder":
-            if core.open_in_file_manager(DOWNLOAD_DIR):
-                self._json({"ok": True})
+            folder = _download_dir()
+            if core.open_in_file_manager(folder):
+                self._json({"ok": True, "folder": os.path.basename(folder)})
             else:
-                self._json({"error": "打不开文件管理器，请手动打开 downloads 文件夹"}, 500)
+                self._json({"error": "打不开文件管理器，请手动打开：%s" % folder}, 500)
             return
         if path == "/api/retry":
             jid = str(self._read_json().get("id") or "")
@@ -370,7 +482,7 @@ def _write_shortcut(url):
 
 
 def serve(port=8765):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    folder = _download_dir()   # 顺便确保目录存在
 
     # 已经开着一个的话，直接把那个页面打开，不再起第二个
     for p in range(port, port + 8):
@@ -404,6 +516,7 @@ def serve(port=8765):
     print("=" * 56)
     print("  网页版已启动")
     print("  地址：%s" % url)
+    print("  保存到：%s" % folder)
     print("  浏览器没自动弹出来的话：双击同目录的「打开网页版.url」")
     print("  或者把上面那行地址复制到浏览器打开")
     print("  也可以在这里输入 o 再按回车，让我再开一次")

@@ -12,7 +12,6 @@
 
 import argparse
 import atexit
-import json
 import os
 import socket
 import sys
@@ -23,13 +22,7 @@ import core
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
-DEFAULT_CONFIG = {
-    "quality": "auto",       # auto / 1080 / 720 / 540
-    "prefer_h264": True,     # 优先 H.264，兼容性最好
-    "save_meta": True,       # 保存封面 + 文案
-    "save_audio": False,     # 顺便提取 MP3
-    "profile_limit": 20,     # 主页链接最多取多少个作品
-}
+DEFAULT_CONFIG = core.DEFAULT_CONFIG
 
 QUALITY_CHOICES = {"1": "auto", "2": "1080", "3": "720", "4": "540"}
 
@@ -85,20 +78,12 @@ def pause_if_needed(args):
 # 配置
 # --------------------------------------------------------------------------- #
 def load_config():
-    if os.path.isfile(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = dict(DEFAULT_CONFIG)
-                cfg.update(json.load(f))
-                return cfg
-        except Exception:
-            pass
-    return wizard()
+    # 真正的读写在 core 里，网页版用的是同一个函数，免得两边行为漂移
+    return core.load_config(CONFIG_PATH, wizard)
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    core.save_config(CONFIG_PATH, cfg)
 
 
 def ask(prompt, default="", valid=None):
@@ -284,42 +269,19 @@ def download_versions(info, versions, folder, ffmpeg, save_audio):
 
 
 def handle_audio(info, video_path, folder, ffmpeg):
-    if ffmpeg:
-        out = core.unique_path(folder, info["base"] + "[音频]", "mp3")
-        try:
-            core.extract_mp3(video_path, out, ffmpeg)
-            print("  %s %s（从视频音轨转的）" % (c("♪", "36"), os.path.basename(out)))
-            return [out]
-        except Exception as e:  # noqa: BLE001
-            print("  %s 提取 MP3 失败：%s" % (c("✗", "31"), e))
-
-    if info.get("music"):
-        ext = "mp3" if ".mp3" in info["music"].lower() else "m4a"
-        out = core.unique_path(folder, info["base"] + "[原声]", ext)
-        try:
-            core.download_stream(info["music"], out, timeout=45)
-            print("  %s %s（原声替代，装个 ffmpeg 就能从视频里抽音轨）"
-                  % (c("♪", "36"), os.path.basename(out)))
-            return [out]
-        except Exception:
-            pass
-    print("  %s 没找到 ffmpeg，跳过 MP3" % c("!", "33"))
-    return []
+    items = core.save_audio(info, video_path, folder, ffmpeg)
+    for path, note in items:
+        print("  %s %s（%s）" % (c("♪", "36"), os.path.basename(path), note))
+    if not items:
+        print("  %s 没找到 ffmpeg，跳过 MP3" % c("!", "33"))
+    return [path for path, _ in items]
 
 
 def save_extras(info, folder, cfg):
-    out = []
-    if cfg.get("save_meta"):
-        try:
-            p = core.save_meta(info, folder)
-            out.append(p)
-            print("  %s %s" % (c("✓", "32"), os.path.basename(p)))
-        except Exception as e:  # noqa: BLE001
-            print("  %s 文案保存失败：%s" % (c("✗", "31"), e))
-        cpath = core.save_cover(info, folder)
-        if cpath:
-            out.append(cpath)
-            print("  %s %s" % (c("✓", "32"), os.path.basename(cpath)))
+    """存文案和封面。真正干活的是 core.save_extras，网页版用的是同一份。"""
+    out = core.save_extras(info, folder, with_meta=cfg.get("save_meta", True))
+    for path in out:
+        print("  %s %s" % (c("✓", "32"), os.path.basename(path)))
     return out
 
 
@@ -340,7 +302,7 @@ def run(args):
         cfg["save_meta"] = True
     if args.max:
         cfg["profile_limit"] = args.max
-    folder = os.path.abspath(args.out or os.path.join(BASE_DIR, "downloads"))
+    folder = os.path.abspath(core.config_output_dir(BASE_DIR, cfg, args.out))
     os.makedirs(folder, exist_ok=True)
 
     inputs = collect_inputs(args.inputs)
