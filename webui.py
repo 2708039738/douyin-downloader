@@ -259,6 +259,7 @@ def _download_job(job_id, info, cfg=None):
         _update(job_id, status="done", path=path, filename=os.path.basename(path),
                 size=size, received=size, finished=time.time(), speed=0,
                 extras=[os.path.basename(p) for p in extras],
+                _extras=[p for p in extras],
                 saved_to=os.path.basename(folder))
         print("[完成] %s (%.1f MB)" % (os.path.basename(path), size / 1048576.0))
     except Exception as e:  # noqa: BLE001
@@ -450,7 +451,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/retry":
             jid = str(self._read_json().get("id") or "")
-            _update(jid, status="queued", error="", received=0, speed=0)
+            # 重试是「重新下一遍」，上一次的路径 / 大小 / 附属文件都要清掉，
+            # 否则界面会一边显示「排队中」，一边还挂着旧文件的大小。
+            _update(jid, status="queued", error="", received=0, speed=0, size=0,
+                    finished=0, path=None, filename="", extras=[], _extras=[],
+                    saved_to="")
             with _queue_lock:
                 _queue.append(jid)
                 _queue_lock.notify()
@@ -463,11 +468,16 @@ class Handler(BaseHTTPRequestHandler):
                 if jid in _job_order:
                     _job_order.remove(jid)
             _thumbs.pop(jid, None)
-            if job and job.get("path") and os.path.exists(job["path"]):
-                try:
-                    os.remove(job["path"])
-                except Exception:
-                    pass
+            if job:
+                # 主文件 + 封面 / 文案 / MP3 一起删。按钮写的是「删除任务与文件」，
+                # 只删 mp4 会把附属文件偷偷留在硬盘上。
+                paths = [job.get("path")] + list(job.get("_extras") or [])
+                for p in dict.fromkeys(p for p in paths if p):
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except OSError:
+                        pass
             self._json({"ok": True})
             return
         self._json({"error": "未知接口"}, 404)

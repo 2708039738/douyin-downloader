@@ -273,7 +273,10 @@ def handle_audio(info, video_path, folder, ffmpeg):
     for path, note in items:
         print("  %s %s（%s）" % (c("♪", "36"), os.path.basename(path), note))
     if not items:
-        print("  %s 没找到 ffmpeg，跳过 MP3" % c("!", "33"))
+        if ffmpeg:
+            print("  %s MP3 提取失败，已跳过（检查 ffmpeg 或视频文件）" % c("!", "33"))
+        else:
+            print("  %s 没找到 ffmpeg，跳过 MP3" % c("!", "33"))
     return [path for path, _ in items]
 
 
