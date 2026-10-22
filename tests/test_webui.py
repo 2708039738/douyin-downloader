@@ -5,6 +5,7 @@
 """
 
 import http.client
+import io
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -232,7 +234,8 @@ class WebUITests(unittest.TestCase):
                 LocalServer({"/v.mp4": payload}) as base, \
                 mock.patch.object(webui, "DOWNLOAD_DIR", out):
             info["url"] = base + "/v.mp4"
-            webui._download_job(job["id"], info)
+            with redirect_stdout(io.StringIO()):
+                webui._download_job(job["id"], info)
             with webui._jobs_lock:
                 self.assertEqual(webui._jobs[job["id"]]["status"], "done")
             saved = os.path.join(out, "测试视频.mp4")
@@ -247,7 +250,8 @@ class WebUITests(unittest.TestCase):
                 mock.patch.object(webui, "DOWNLOAD_DIR", out):
             info = {"kind": "gallery", "filename": "图集",
                     "files": [base + "/1.jpg", base + "/2.jpg"]}
-            webui._download_job(job["id"], info)
+            with redirect_stdout(io.StringIO()):
+                webui._download_job(job["id"], info)
             files = os.listdir(out)
             self.assertEqual(len(files), 1)
             self.assertTrue(files[0].endswith(".zip"))
