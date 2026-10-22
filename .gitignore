@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行产物：下载下来的视频 / 音频 / 封面 / 文案，不进仓库
+downloads/
+*.mp4
+*.mp3
+*.m4a
+
+# 本地凭据与个人配置（以后如果往 config.json 里加 cookie，就改用 config.local.json）
+config.local.json
+cookies.txt
+cookie*.json
+.env
+
+# 编辑器 / 系统垃圾
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 启动时自动生成的快捷方式（端口会变）
+打开网页版.url

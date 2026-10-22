@@ -1,0 +1,7 @@
+{
+  "quality": "auto",
+  "prefer_h264": true,
+  "save_meta": true,
+  "save_audio": false,
+  "profile_limit": 20
+}

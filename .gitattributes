@@ -1,0 +1,7 @@
+# 换行符统一规则：.bat 必须踢回 CRLF，否则 cmd 会把命令解析错位
+* text=auto
+*.bat text eol=crlf
+*.url text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
