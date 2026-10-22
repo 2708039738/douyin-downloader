@@ -71,6 +71,10 @@
     cursor:pointer;user-select:none;padding:2px 2px 2px 0;
   }
   .chk input{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+  .chk input[type=number]{
+    width:54px;padding:3px 5px;border:1px solid #dfe3ea;border-radius:7px;
+    font-size:12.5px;font-family:inherit;color:var(--ink);background:#fff;
+  }
   .conn{
     font-size:12px;color:#9aa1ad;display:inline-flex;align-items:center;gap:6px;
     padding:6px 10px;border-radius:9px;background:#f5f6f8;
@@ -159,8 +163,9 @@
     <textarea id="input" placeholder="把抖音分享链接粘到这里，一行一个。整段分享文案也没关系，会自动识别链接。"></textarea>
     <div class="controls">
       <div class="seg" id="wmSeg">
-        <button data-wm="0" class="on">无水印</button>
-        <button data-wm="1">带水印</button>
+        <button data-v="nowm" class="on">无水印</button>
+        <button data-v="wm">带水印</button>
+        <button data-v="both">两个都要</button>
       </div>
       <select id="quality" title="清晰度">
         <option value="auto">最高画质</option>
@@ -171,10 +176,19 @@
       <label class="chk" title="H.264 兼容性最好；取消勾选可下到更高清的 H.265">
         <input type="checkbox" id="h264" checked> H.264 优先
       </label>
+      <label class="chk" title="保存封面和文案；不勾就跟 config.json 的 save_meta 一样">
+        <input type="checkbox" id="meta" checked> 封面文案
+      </label>
+      <label class="chk" title="顺便提取 MP3；没有 ffmpeg 会改成下载抖音原声">
+        <input type="checkbox" id="audio"> MP3
+      </label>
+      <label class="chk" title="只对主页链接有效，跟命令行的 --max 一样">
+        主页最多 <input type="number" id="plimit" min="1" max="200" value="20"> 个
+      </label>
       <div class="grow"></div>
       <button class="primary" id="go">开始下载</button>
     </div>
-    <p class="hint">无水印走原片地址，画质最高；带水印是抖音官方的下载版。图集会自动打包成 zip。默认优先 H.264，任何播放器都能开。</p>
+    <p class="hint">无水印走原片地址，画质最高；带水印是抖音官方的下载版；选「两个都要」会排两个任务，各下一份。图集自动打包成 zip。封面文案和 MP3 跟命令行一样，按这里的勾选（默认取 config.json）。</p>
   </section>
 
   <div class="list" id="list"></div>
@@ -190,15 +204,19 @@
 const $ = s => document.querySelector(s);
 const list = $('#list');
 let jobs = [];
-let watermark = false;
 
 // ---- 水印切换 ----
+let versions = 'nowm';
 $('#wmSeg').addEventListener('click', e => {
   const btn = e.target.closest('button');
   if (!btn) return;
-  watermark = btn.dataset.wm === '1';
-  [...$('#wmSeg').children].forEach(b => b.classList.toggle('on', b === btn));
-  btn.classList.toggle('wm-on', watermark && btn.classList.contains('on'));
+  versions = btn.dataset.v || 'nowm';
+  [...$('#wmSeg').children].forEach(b => {
+    const on = b === btn;
+    b.classList.toggle('on', on);
+    // 带水印 / 两个都要 用同一个强调色，一眼能看出「这次会带水印」
+    b.classList.toggle('wm-on', on && b.dataset.v !== 'nowm');
+  });
 });
 
 // ---- 提交 ----
@@ -215,8 +233,14 @@ async function submit() {
     const r = await fetch('/api/parse', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text, watermark, quality: $('#quality').value,
-                            prefer_h264: $('#h264').checked})
+      body: JSON.stringify({
+        text, versions,
+        quality: $('#quality').value,
+        prefer_h264: $('#h264').checked,
+        save_meta: $('#meta').checked,
+        save_audio: $('#audio').checked,
+        profile_limit: Number($('#plimit').value) || undefined
+      })
     });
     const data = await r.json();
     if (!r.ok) { toast(data.error || '解析失败'); return; }
@@ -392,6 +416,9 @@ async function loadDefaults() {
     const sel = $('#quality');
     if (c.quality && [...sel.options].some(o => o.value === c.quality)) sel.value = c.quality;
     if (typeof c.prefer_h264 === 'boolean') $('#h264').checked = c.prefer_h264;
+    if (typeof c.save_meta === 'boolean') $('#meta').checked = c.save_meta;
+    if (typeof c.save_audio === 'boolean') $('#audio').checked = c.save_audio;
+    if (c.profile_limit) $('#plimit').value = c.profile_limit;
   } catch (e) { /* 服务还没起来就用页面上的默认值 */ }
 }
 

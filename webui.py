@@ -41,6 +41,21 @@ _thumbs = {}
 _cfg_lock = threading.Lock()
 _cfg_cache = (None, None)   # (mtime, cfg)
 
+# 跟 app.py 里的「1 无水印 / 2 带水印 / 3 两个都要」一一对应
+VERSIONS = {
+    "nowm": [False],
+    "wm": [True],
+    "both": [False, True],
+}
+
+
+def versions_of(data):
+    """把前端的 versions / 老字段 watermark 统一成「要下哪几个版本」。"""
+    v = (data or {}).get("versions")
+    if v not in VERSIONS:
+        v = "wm" if (data or {}).get("watermark") else "nowm"
+    return VERSIONS[v]
+
 
 def _config():
     """读一次 config.json，文件改了就重新读 —— 网页版也能用上清晰度等默认值。"""
@@ -63,8 +78,9 @@ def _download_dir(cfg=None):
     return folder
 
 
-def _new_job(url, watermark, quality, prefer_h264=True):
+def _new_job(url, watermark, quality, prefer_h264=True, opts=None):
     global _seq
+    opts = opts or {}
     job = {
         "id": "",
         "url": url,
@@ -85,6 +101,10 @@ def _new_job(url, watermark, quality, prefer_h264=True):
         "extras": [],
         "saved_to": "",
         "batch_count": 0,
+        # None = 跟 config.json 走；True/False = 这个任务自己指定的
+        "save_meta": opts.get("save_meta"),
+        "save_audio": opts.get("save_audio"),
+        "profile_limit": int(opts.get("profile_limit") or 0),
         "created": time.time(),
         "finished": 0,
     }
@@ -113,11 +133,20 @@ def _update(job_id, **kw):
             job.update(kw)
 
 
+def _job_opts(job):
+    """把任务上「本任务专属」的选项摘出来，主页拆出来的子任务要继承这些。"""
+    return {
+        "save_meta": job.get("save_meta"),
+        "save_audio": job.get("save_audio"),
+        "profile_limit": job.get("profile_limit") or 0,
+    }
+
+
 def _expand_profile(job_id, target, job, cfg):
     """主页链接：先把作品列表取出来，再一个一个排进队列。"""
     _update(job_id, status="parsing", title="主页：正在读取作品列表…")
     try:
-        limit = int(cfg.get("profile_limit") or 20)
+        limit = int(job.get("profile_limit") or cfg.get("profile_limit") or 20)
     except (TypeError, ValueError):
         limit = 20
     try:
@@ -133,7 +162,7 @@ def _expand_profile(job_id, target, job, cfg):
         return
     for u in links:
         child = _new_job(u, job.get("watermark"), job.get("quality"),
-                         job.get("prefer_h264", True))
+                         job.get("prefer_h264", True), _job_opts(job))
         with _queue_lock:
             _queue.append(child["id"])
             _queue_lock.notify()
@@ -186,6 +215,13 @@ def _download_job(job_id, info, cfg=None):
     started = time.time()
     cfg = _config() if cfg is None else cfg
     folder = _download_dir(cfg)
+    with _jobs_lock:
+        job = dict(_jobs.get(job_id) or {})
+    # 任务上没指定就跟 config.json 走；命令行有 --meta/--audio，网页版这里等价
+    with_meta = cfg.get("save_meta", True) if job.get("save_meta") is None \
+        else bool(job["save_meta"])
+    want_audio = cfg.get("save_audio", False) if job.get("save_audio") is None \
+        else bool(job["save_audio"])
     try:
         if info["kind"] == "video":
             path = core.unique_path(folder, info["filename"], "mp4")
@@ -213,8 +249,8 @@ def _download_job(job_id, info, cfg=None):
                                          on_progress=progress)
 
         # 视频下好了再补封面 / 文案 / MP3 —— 和命令行走的是同一套 core 函数
-        extras = core.save_extras(info, folder, with_meta=cfg.get("save_meta", True))
-        if cfg.get("save_audio") and info.get("kind") == "video":
+        extras = core.save_extras(info, folder, with_meta=with_meta)
+        if want_audio and info.get("kind") == "video":
             for apath, note in core.save_audio(info, path, folder, core.find_ffmpeg()):
                 extras.append(apath)
                 print("[音频] %s（%s）" % (os.path.basename(apath), note))
@@ -389,13 +425,20 @@ class Handler(BaseHTTPRequestHandler):
             # 前端没显式指定时，用 config.json 里的默认值（以前网页版完全忽略配置）
             quality = data.get("quality") or cfg.get("quality") or "auto"
             prefer_h264 = data.get("prefer_h264", cfg.get("prefer_h264", True))
+            opts = {
+                "save_meta": data.get("save_meta"),
+                "save_audio": data.get("save_audio"),
+                "profile_limit": data.get("profile_limit") or 0,
+            }
             created = []
             for u in urls:
-                job = _new_job(u, data.get("watermark"), quality, prefer_h264)
-                created.append(job["id"])
-                with _queue_lock:
-                    _queue.append(job["id"])
-                    _queue_lock.notify()
+                # 「两个都要」= 一个链接排两个任务，跟命令行 3) 的行为一致
+                for want_wm in versions_of(data):
+                    job = _new_job(u, want_wm, quality, prefer_h264, opts)
+                    created.append(job["id"])
+                    with _queue_lock:
+                        _queue.append(job["id"])
+                        _queue_lock.notify()
             self._json({"created": created})
             return
         if path == "/api/open-folder":

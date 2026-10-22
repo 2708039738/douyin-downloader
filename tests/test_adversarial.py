@@ -372,8 +372,8 @@ class WebUIExtrasTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def _run_job(self, info, cfg):
-        job = webui._new_job(info["url"], False, "auto")
+    def _run_job(self, info, cfg, opts=None):
+        job = webui._new_job(info["url"], False, "auto", opts=opts)
         with mock.patch.object(webui, "DOWNLOAD_DIR", self.tmp.name), \
                 redirect_stdout(io.StringIO()):
             webui._download_job(job["id"], info, cfg)
@@ -484,6 +484,93 @@ class WebUIExtrasTests(unittest.TestCase):
                 self.assertFalse(data["prefer_h264"])
                 self.assertEqual(data["profile_limit"], 7)
                 self.assertNotIn("out", data)   # 别把本机路径漏给页面
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            reset_state()
+
+    def test_job_level_save_meta_off_beats_config(self):
+        """单个任务的开关要盖过 config：命令行 --no-meta 的等价物。"""
+        with LocalServer({"/v.mp4": b"mp4-bytes", "/cover.jpg": b"jpg-bytes"}) as base:
+            _, job = self._run_job(make_info(base), {"save_meta": True},
+                                   opts={"save_meta": False})
+        self.assertEqual(os.listdir(self.tmp.name), ["作者-文案[无水印].mp4"])
+        self.assertEqual(job["extras"], [])
+
+    def test_job_level_audio_on_beats_config(self):
+        """config 里 save_audio=false，但这次任务勾了 MP3，也要出音频。"""
+        files = {"/v.mp4": b"mp4-bytes", "/m.m4a": b"music-bytes"}
+        with LocalServer(files) as base, \
+                mock.patch.object(core, "find_ffmpeg", return_value=None):
+            _, job = self._run_job(make_info(base, music=base + "/m.m4a"),
+                                   {"save_meta": False, "save_audio": False},
+                                   opts={"save_audio": True})
+        self.assertIn("作者-文案[原声].m4a", os.listdir(self.tmp.name))
+        self.assertEqual(job["status"], "done")
+
+    def test_job_level_profile_limit_beats_config(self):
+        job = webui._new_job("https://www.douyin.com/user/x", False, "auto",
+                             opts={"profile_limit": 3})
+        with mock.patch.object(webui.BROWSER, "profile_links", return_value=[]) as fn:
+            webui._expand_profile(job["id"], "https://www.douyin.com/user/x", job,
+                                  {"profile_limit": 99})
+        self.assertEqual(fn.call_args.kwargs["limit"], 3)
+
+    def test_versions_mapping(self):
+        """命令行 1/2/3 对应 nowm/wm/both；老字段 watermark 还要能用。"""
+        self.assertEqual(webui.versions_of({"versions": "nowm"}), [False])
+        self.assertEqual(webui.versions_of({"versions": "wm"}), [True])
+        self.assertEqual(webui.versions_of({"versions": "both"}), [False, True])
+        self.assertEqual(webui.versions_of({"watermark": True}), [True])
+        self.assertEqual(webui.versions_of({}), [False])
+        self.assertEqual(webui.versions_of({"versions": "乱写"}), [False])
+
+    def test_parse_both_creates_two_jobs_per_link(self):
+        """「两个都要」：一个链接排两个任务，跟命令行 3) 一致。"""
+        httpd = start_webui_server()
+        port = httpd.server_address[1]
+        try:
+            client = RawClient(port)
+            payload = json.dumps({
+                "text": "https://www.douyin.com/video/7123456789012345678",
+                "versions": "both", "save_meta": False, "save_audio": True,
+                "profile_limit": 5,
+            }).encode()
+            code, body = client.request(
+                "POST", "/api/parse", host="127.0.0.1:%d" % port,
+                headers=[("Content-Type", "application/json")], body=payload)
+            self.assertEqual(code, 200)
+            created = json.loads(body.decode("utf-8"))["created"]
+            self.assertEqual(len(created), 2)
+            with webui._jobs_lock:
+                wms = sorted(webui._jobs[i]["watermark"] for i in created)
+                opts = [(webui._jobs[i]["save_meta"], webui._jobs[i]["save_audio"],
+                         webui._jobs[i]["profile_limit"]) for i in created]
+            self.assertEqual(wms, [False, True])
+            self.assertEqual(opts, [(False, True, 5)] * 2)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            reset_state()
+
+    def test_parse_legacy_watermark_field_still_works(self):
+        """老前端 / 老脚本还在发 ```watermark``` 布尔，不能破坏。"""
+        httpd = start_webui_server()
+        port = httpd.server_address[1]
+        try:
+            client = RawClient(port)
+            payload = json.dumps({
+                "text": "https://www.douyin.com/video/7123456789012345678",
+                "watermark": True,
+            }).encode()
+            code, body = client.request(
+                "POST", "/api/parse", host="127.0.0.1:%d" % port,
+                headers=[("Content-Type", "application/json")], body=payload)
+            self.assertEqual(code, 200)
+            created = json.loads(body.decode("utf-8"))["created"]
+            self.assertEqual(len(created), 1)
+            with webui._jobs_lock:
+                self.assertTrue(webui._jobs[created[0]]["watermark"])
         finally:
             httpd.shutdown()
             httpd.server_close()
