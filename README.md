@@ -1,5 +1,7 @@
 # 抖音视频下载器
 
+![CI](https://github.com/2708039738/douyin-downloader/actions/workflows/ci.yml/badge.svg)
+
 把链接拖到 `下载.bat` 上 → 选一次水印 → 视频就进 `downloads/` 了。
 
 - **无水印 / 带水印 / 两个都要**：每次运行都会问你，不会下错版本
@@ -146,6 +148,21 @@ python app.py --checkenv                           # 检查依赖是否齐全
 **主页只抓到了一部分**
 主页是滚动加载的，程序会自己往下滚；如果作者作品很多、或者需要登录才能看全，
 调大 `profile_limit` 多试一次。
+
+## 开发与测试
+
+改动代码后，跑一遍测试就知道有没有弄坏别的东西：
+
+```bash
+python -m unittest discover -v
+```
+
+- 不联网、不打开抖音、不需要 pip 安装，几秒跑完
+- 覆盖链接解析、清晰度选择、下载（含半路断线）、图集打包、网页版接口、配置读写
+- 每次 push / PR 会自动在 **Windows / macOS / Linux × Python 3.9 / 3.11 / 3.13** 上跑一遍，
+  配置在 `.github/workflows/ci.yml`
+
+`.bat` 文件必须保持 CRLF 换行（cmd.exe 对 LF 会解析错位），`tests/test_app.py` 里有一条测试专门盯着这件事。
 
 ## 说明
 
