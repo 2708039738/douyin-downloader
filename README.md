@@ -86,7 +86,8 @@ python app.py --checkenv                           # 检查依赖是否齐全
 作者-文案[信息].txt
 ```
 
-同名文件不会覆盖，会自动加 `(1)`、`(2)`。
+同名文件不会覆盖，会自动加 `(1)`、`(2)`；两个任务同时下同一个作品也不会撞到一起。
+下载先写 `.part`，校验通过才改成正式文件名，所以被强杀时不会留下一个放不了的假视频。
 
 ## 设置
 
@@ -181,7 +182,7 @@ Windows 上同理，走 `tasklist /FI "PID eq N"` 并按列精确匹配 pid
 python -m unittest discover -v
 ```
 
-- 138 个用例，不联网、不打开抖音、不需要 pip 安装，十几秒跑完
+- 153 个用例，不联网、不打开抖音、不需要 pip 安装，二十几秒跑完
 - 覆盖链接解析、清晰度选择、下载（含半路断线 / 谎报长度 / 空响应）、图集打包、
   文案封面落盘、网页版接口、配置读写
 - `tests/test_adversarial.py` 专门从攻击者角度写：伪造 `Host` / `Origin` 的十几种绕过写法、
@@ -190,6 +191,9 @@ python -m unittest discover -v
   同目录别人的文件不能碰，重试要把上一次的状态清空
 - `tests/test_gallery_dedupe.py` 盯着「图集 + 两个都要」的去重，以及 `/api/parse`
   收到畸形 JSON（数组、字符串布尔、非法数字）时不能崩
+- `tests/test_hardening.py` 盯着这次体检的几条：并发任务不能撞到同一个文件、
+  下载失败不能留下 `.part` 或误删别人的文件、坏图必须报出来、畸形 `text` 要回 400
+  而不是把连接打断
 - 每次 push / PR 会自动在 **Windows / macOS / Linux × Python 3.9 / 3.11 / 3.13** 上跑一遍，
   配置在 `.github/workflows/ci.yml`
 
