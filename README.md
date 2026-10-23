@@ -53,6 +53,7 @@
   初始值来自 `config.json`，改完不用重启
 - 下载目录由 `config.json` 的 `out` 决定，「打开下载文件夹」按钮和完成提示都指向同一个目录
 - 主页链接会自动拆成一个个作品排进队列
+- 图集没有「带水印版本」，所以选「两个都要」时只会下一份 zip，另一个任务标成「已跳过」
 
 ### 命令行
 
@@ -180,13 +181,15 @@ Windows 上同理，走 `tasklist /FI "PID eq N"` 并按列精确匹配 pid
 python -m unittest discover -v
 ```
 
-- 125 个用例，不联网、不打开抖音、不需要 pip 安装，十几秒跑完
+- 138 个用例，不联网、不打开抖音、不需要 pip 安装，十几秒跑完
 - 覆盖链接解析、清晰度选择、下载（含半路断线 / 谎报长度 / 空响应）、图集打包、
   文案封面落盘、网页版接口、配置读写
 - `tests/test_adversarial.py` 专门从攻击者角度写：伪造 `Host` / `Origin` 的十几种绕过写法、
   PID 复用时的误杀、畸形 `Content-Length`、任务 id 并发撞号、路径穿越
 - `tests/test_followup.py` 盯着网页版的「删」：删任务要把主文件 + 封面/文案/原声一起清掉，
   同目录别人的文件不能碰，重试要把上一次的状态清空
+- `tests/test_gallery_dedupe.py` 盯着「图集 + 两个都要」的去重，以及 `/api/parse`
+  收到畸形 JSON（数组、字符串布尔、非法数字）时不能崩
 - 每次 push / PR 会自动在 **Windows / macOS / Linux × Python 3.9 / 3.11 / 3.13** 上跑一遍，
   配置在 `.github/workflows/ci.yml`
 
