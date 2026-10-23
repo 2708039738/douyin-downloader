@@ -50,11 +50,29 @@ VERSIONS = {
 
 
 def versions_of(data):
-    """把前端的 versions / 老字段 watermark 统一成「要下哪几个版本」。"""
-    v = (data or {}).get("versions")
-    if v not in VERSIONS:
-        v = "wm" if (data or {}).get("watermark") else "nowm"
+    """把前端的 versions / 老字段 watermark 统一成「要下哪几个版本」。
+
+    versions 只接受字符串；传数组/对象/数字时回落到 watermark，
+    避免 `v not in VERSIONS` 直接抛 unhashable 异常。
+    """
+    data = data if isinstance(data, dict) else {}
+    v = data.get("versions")
+    if not isinstance(v, str) or v not in VERSIONS:
+        v = "wm" if data.get("watermark") else "nowm"
     return VERSIONS[v]
+
+
+def _bool_opt(value):
+    """任务级开关只认真布尔；字符串 "false" 不能被当成 True。"""
+    return value if isinstance(value, bool) else None
+
+
+def _limit_opt(value):
+    """主页数量只认非负整数；"abc"、[]、None 都回落到 0（= 跟 config 走）。"""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _config():
@@ -101,10 +119,14 @@ def _new_job(url, watermark, quality, prefer_h264=True, opts=None):
         "extras": [],
         "saved_to": "",
         "batch_count": 0,
+        "skipped": False,
         # None = 跟 config.json 走；True/False = 这个任务自己指定的
-        "save_meta": opts.get("save_meta"),
-        "save_audio": opts.get("save_audio"),
-        "profile_limit": int(opts.get("profile_limit") or 0),
+        "save_meta": _bool_opt(opts.get("save_meta")),
+        "save_audio": _bool_opt(opts.get("save_audio")),
+        "profile_limit": _limit_opt(opts.get("profile_limit")),
+        # 同一次 /api/parse 里排出来的任务共享批次号；主页拆出来的子任务继承它。
+        # 图集没有带水印版本，「两个都要」时靠它认出重复任务。
+        "_batch": opts.get("batch") or "",
         "created": time.time(),
         "finished": 0,
     }
@@ -139,7 +161,34 @@ def _job_opts(job):
         "save_meta": job.get("save_meta"),
         "save_audio": job.get("save_audio"),
         "profile_limit": job.get("profile_limit") or 0,
+        "batch": job.get("_batch"),
     }
+
+
+def _should_skip_gallery(job, info):
+    """图集没有「带水印」版本：同批次里已经有「无水印」任务时，别重复下一份。
+
+    只在图集 + 带水印任务上判断。优先用 /api/parse 发的批次号；
+    老调用没有批次号时，退回「同一个 URL 且创建时间相差 2 分钟内」。
+    如果无水印兄弟任务已经失败，就让这个任务照常下载，避免两边都空。
+    """
+    if (info or {}).get("kind") != "gallery" or not job.get("watermark"):
+        return False
+    batch = job.get("_batch")
+    created = job.get("created") or 0
+    with _jobs_lock:
+        for other in _jobs.values():
+            if other["id"] == job["id"] or other.get("watermark"):
+                continue
+            if other.get("status") == "error":
+                continue
+            if batch:
+                if other.get("_batch") == batch:
+                    return True
+            elif other.get("url") == job.get("url") and \
+                    abs((other.get("created") or 0) - created) <= 120:
+                return True
+    return False
 
 
 def _expand_profile(job_id, target, job, cfg):
@@ -193,6 +242,12 @@ def _resolve_worker():
             aweme = BROWSER.detail(target)
             info = core.describe(aweme, watermark=job["watermark"], quality=job["quality"],
                                  prefer_h264=job.get("prefer_h264", True))
+            if _should_skip_gallery(job, info):
+                _update(job_id, status="done", skipped=True,
+                        title="图集没有带水印版本，已跳过重复任务",
+                        filename="", saved_to="", finished=time.time(), speed=0)
+                print("[跳过] 图集没有带水印版本：%s" % target)
+                continue
             cover = info.get("cover_url")
             if cover:
                 try:
@@ -346,7 +401,9 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
+            parsed = json.loads(self.rfile.read(length).decode("utf-8", "ignore"))
+            # 只接受 JSON 对象；数组/字符串/null 一律当空对象，避免 .get 崩掉
+            return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
 
@@ -430,6 +487,8 @@ class Handler(BaseHTTPRequestHandler):
                 "save_meta": data.get("save_meta"),
                 "save_audio": data.get("save_audio"),
                 "profile_limit": data.get("profile_limit") or 0,
+                # 同一次请求排出来的任务（含「两个都要」和主页子任务）共享批次号
+                "batch": str(time.time_ns()),
             }
             created = []
             for u in urls:
@@ -455,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
             # 否则界面会一边显示「排队中」，一边还挂着旧文件的大小。
             _update(jid, status="queued", error="", received=0, speed=0, size=0,
                     finished=0, path=None, filename="", extras=[], _extras=[],
-                    saved_to="")
+                    saved_to="", skipped=False)
             with _queue_lock:
                 _queue.append(jid)
                 _queue_lock.notify()

@@ -364,10 +364,14 @@ function updateJob(j) {
   else if (j.status === 'parsing') text = '正在解析视频信息…';
   else if (j.status === 'downloading') text = j.speed ? `下载中 ${human(j.speed)}/s` : '下载中…';
   else if (j.status === 'done') {
-    text = j.batch_count ? `已拆成 ${j.batch_count} 个任务`
-         : ((j.saved_to || 'downloads') === 'downloads' ? '已保存到 downloads'
-            : `已保存到 ${j.saved_to}`);
-    if (j.extras && j.extras.length) text += `（另存 ${j.extras.length} 个附属文件）`;
+    if (j.skipped) {
+      text = '图集没有带水印版本，已跳过';
+    } else {
+      text = j.batch_count ? `已拆成 ${j.batch_count} 个任务`
+           : ((j.saved_to || 'downloads') === 'downloads' ? '已保存到 downloads'
+              : `已保存到 ${j.saved_to}`);
+      if (j.extras && j.extras.length) text += `（另存 ${j.extras.length} 个附属文件）`;
+    }
   }
   else if (j.status === 'error') text = j.error;
   set('status', text);
