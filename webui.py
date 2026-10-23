@@ -48,6 +48,20 @@ VERSIONS = {
     "both": [False, True],
 }
 
+QUALITY_CHOICES = ("auto", "1080", "720", "540")
+
+# 缩略图缓存条数上限（每张最多 2 MB）
+MAX_THUMBS = 200
+
+# 同时下载的任务数上限。主页一次抓 20 个，不限制就是 20 条连接一起拉
+MAX_DOWNLOADS = 3
+_download_slots = threading.Semaphore(MAX_DOWNLOADS)
+
+
+def _str_opt(value, allowed):
+    """只接受白名单里的字符串。数字、数组、"false" 一律当没传。"""
+    return value if isinstance(value, str) and value in allowed else None
+
 
 def versions_of(data):
     """把前端的 versions / 老字段 watermark 统一成「要下哪几个版本」。
@@ -155,6 +169,17 @@ def _update(job_id, **kw):
             job.update(kw)
 
 
+def _remember_thumb(job_id, data):
+    """记一张缩略图，超过上限就丢最老的。
+
+    每张最多 2 MB，不封顶的话网页版挂一天、下几百个作品就能吃掉几百 MB，
+    最后被系统当成内存泄漏杀掉。
+    """
+    _thumbs[job_id] = data
+    while len(_thumbs) > MAX_THUMBS:
+        _thumbs.pop(next(iter(_thumbs)), None)
+
+
 def _job_opts(job):
     """把任务上「本任务专属」的选项摘出来，主页拆出来的子任务要继承这些。"""
     return {
@@ -251,7 +276,7 @@ def _resolve_worker():
             cover = info.get("cover_url")
             if cover:
                 try:
-                    _thumbs[job_id] = core.fetch_bytes(cover, limit=2 * 1024 * 1024)
+                    _remember_thumb(job_id, core.fetch_bytes(cover, limit=2 * 1024 * 1024))
                 except Exception:
                     pass
             _update(job_id, status="downloading", title=info["title"], author=info["author"],
@@ -267,6 +292,24 @@ def _resolve_worker():
 
 
 def _download_job(job_id, info, cfg=None):
+    """占一个下载槽位再真正开下。
+
+    以前是每个任务起一个线程直接下，主页一次抓 20 个就等于 20 条连接同时拉：
+    带宽被打满、更容易被风控，文件句柄也吃紧。这里最多同时跑 MAX_DOWNLOADS 个，
+    排队的任务状态回落到 queued，界面上看得出来它在等。
+    """
+    acquired = _download_slots.acquire(blocking=False)
+    if not acquired:
+        _update(job_id, status="queued")
+        _download_slots.acquire()
+    try:
+        _update(job_id, status="downloading")
+        _download_job_run(job_id, info, cfg)
+    finally:
+        _download_slots.release()
+
+
+def _download_job_run(job_id, info, cfg=None):
     started = time.time()
     cfg = _config() if cfg is None else cfg
     folder = _download_dir(cfg)
@@ -277,6 +320,7 @@ def _download_job(job_id, info, cfg=None):
         else bool(job["save_meta"])
     want_audio = cfg.get("save_audio", False) if job.get("save_audio") is None \
         else bool(job["save_audio"])
+    failed = [0]   # 图集里没下到的张数；视频恒为 0
     try:
         if info["kind"] == "video":
             path = core.unique_path(folder, info["filename"], "mp4")
@@ -291,7 +335,8 @@ def _download_job(job_id, info, cfg=None):
                         job["size"] = total
                     job["speed"] = int(got / max(time.time() - started, 0.001))
 
-            core.download_stream(info["url"], path, on_progress=progress)
+            # 断网 / 半截响应自动重试，别让一次抖动毁掉整个任务
+            core.download_with_retry(info["url"], path, on_progress=progress)
         else:
             def progress(done, total):
                 with _jobs_lock:
@@ -300,8 +345,16 @@ def _download_job(job_id, info, cfg=None):
                         job["received"] = done
                         job["size"] = total
 
+            failed = [0]
+
+            def on_fail(idx, url, err):
+                failed[0] += 1
+                print("[图集] 第 %d 张没下到：%s" % (idx, err))
+
             path = core.download_gallery(info["files"], folder, info["filename"],
-                                         on_progress=progress)
+                                         on_progress=progress, on_failure=on_fail)
+            if failed[0]:
+                print("[图集] 共 %d 张失败，zip 里是剩下的图" % failed[0])
 
         # 视频下好了再补封面 / 文案 / MP3 —— 和命令行走的是同一套 core 函数
         extras = core.save_extras(info, folder, with_meta=with_meta)
@@ -315,6 +368,7 @@ def _download_job(job_id, info, cfg=None):
                 size=size, received=size, finished=time.time(), speed=0,
                 extras=[os.path.basename(p) for p in extras],
                 _extras=[p for p in extras],
+                gallery_failed=failed[0],
                 saved_to=os.path.basename(folder))
         print("[完成] %s (%.1f MB)" % (os.path.basename(path), size / 1048576.0))
     except Exception as e:  # noqa: BLE001
@@ -475,14 +529,26 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/api/parse":
             data = self._read_json()
-            urls = core.extract_urls(data.get("text") or "")
+            # text 只接受字符串。这不是洁癖：以前直接把非字符串丢给 extract_urls，
+            # TypeError 会从 handler 里冒出去，前端看到的不是「参数不对」而是
+            # 「连不上本地服务」（连接被重置），排查起来完全指错方向。
+            text = data.get("text")
+            if text is None:
+                text = ""
+            if not isinstance(text, str):
+                self._json({"error": "text 必须是字符串"}, 400)
+                return
+            urls = core.extract_urls(text)
             if not urls:
                 self._json({"error": "没识别到抖音链接"}, 400)
                 return
             cfg = _config()
             # 前端没显式指定时，用 config.json 里的默认值（以前网页版完全忽略配置）
-            quality = data.get("quality") or cfg.get("quality") or "auto"
-            prefer_h264 = data.get("prefer_h264", cfg.get("prefer_h264", True))
+            quality = (_str_opt(data.get("quality"), QUALITY_CHOICES)
+                       or cfg.get("quality") or "auto")
+            # 字符串 "false" 不能当 True 用，只认真正的布尔
+            ph = data.get("prefer_h264")
+            prefer_h264 = ph if isinstance(ph, bool) else cfg.get("prefer_h264", True)
             opts = {
                 "save_meta": data.get("save_meta"),
                 "save_audio": data.get("save_audio"),
@@ -510,6 +576,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/retry":
             jid = str(self._read_json().get("id") or "")
+            with _jobs_lock:
+                exists = jid in _jobs
+            if not exists:
+                # 以前对不存在的 id 也照样塞进队列，队列里堆一堆垃圾项，
+                # 排查「为什么有任务不跑」的时候特别误导
+                self._json({"error": "没有这个任务"}, 404)
+                return
             # 重试是「重新下一遍」，上一次的路径 / 大小 / 附属文件都要清掉，
             # 否则界面会一边显示「排队中」，一边还挂着旧文件的大小。
             _update(jid, status="queued", error="", received=0, speed=0, size=0,
