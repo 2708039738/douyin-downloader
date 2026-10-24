@@ -371,6 +371,7 @@ function updateJob(j) {
            : ((j.saved_to || 'downloads') === 'downloads' ? '已保存到 downloads'
               : `已保存到 ${j.saved_to}`);
       if (j.extras && j.extras.length) text += `（另存 ${j.extras.length} 个附属文件）`;
+      if (j.gallery_failed) text += `（${j.gallery_failed} 张图没下到）`;
     }
   }
   else if (j.status === 'error') text = j.error;
@@ -426,13 +427,14 @@ async function loadDefaults() {
   } catch (e) { /* 服务还没起来就用页面上的默认值 */ }
 }
 
-// 有任务在跑的时候刷新快一点
-setInterval(() => {
+// 有任务在跑的时候刷新快一点；全下完了就把间隔拉长，别一直空转（以前 busy 算了没用）
+async function tick() {
   const busy = jobs.some(j => j.status !== 'done' && j.status !== 'error');
-  poll();
-}, 900);
+  await poll();
+  setTimeout(tick, busy ? 900 : 4000);
+}
 loadDefaults();
-poll();
+tick();
 </script>
 </body>
 </html>

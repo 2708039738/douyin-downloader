@@ -31,6 +31,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+import spec
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
@@ -421,6 +423,8 @@ class Browser:
         self._msg_id = 0
         self._cache = {}
         self._started = False
+        # 去掉 Headless 标识的 UA，第一个标签页拿真实值后缓存，后面所有标签页复用
+        self.ua = ""
 
     # -- 生命周期 ---------------------------------------------------------- #
     def start(self):
@@ -443,6 +447,7 @@ class Browser:
             "--disable-breakpad",
             "--mute-audio",
             "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
             "--renderer-process-limit=2",
             "--window-size=1280,860",
             "--lang=zh-CN",
@@ -550,10 +555,34 @@ class Browser:
             try:
                 with opener(base + "/json/new?about:blank") as r:
                     tab = json.loads(r.read().decode("utf-8", "ignore"))
-                return tab["id"], _WS(tab["webSocketDebuggerUrl"], timeout=15)
+                ws = _WS(tab["webSocketDebuggerUrl"], timeout=15)
+                self._apply_stealth(ws)
+                return tab["id"], ws
             except Exception as e:  # noqa: BLE001
                 last = e
         raise BrowserError("无法创建浏览器标签页: %s" % last)
+
+    def _apply_stealth(self, ws):
+        """让这个标签页看起来是个正常访客，而不是无头程序。
+
+        抖音会看 UA 里的 "HeadlessChrome" 直接判定无头浏览器，返回「验证码中间页」，
+        连 ttwid 都不发，之后所有详情请求全被拦。实测只抹 navigator.webdriver 无效，
+        必须把 UA 也换掉。这里在每次开标签页、导航之前套上去。
+        """
+        if not self.ua:
+            raw = self._eval_on(ws, "navigator.userAgent", 4)
+            if raw:
+                self.ua = spec.clean_user_agent(raw)
+                if spec.is_headless_ua(raw):
+                    self.log("已覆盖无头 UA 标识，避免被判定为机器人")
+        # id 用独立的高位段：_capture() 用的是 1~4，_eval_on() 用 900000+，
+        # 混用会让「这条响应属于哪个请求」变得没法判断（调试时尤其费劲）
+        ws.send({"id": 920001, "method": "Page.addScriptToEvaluateOnNewDocument",
+                 "params": {"source": spec.STEALTH_JS}})
+        if self.ua:
+            ws.send({"id": 920002, "method": "Emulation.setUserAgentOverride",
+                     "params": {"userAgent": self.ua,
+                                "acceptLanguage": "zh-CN,zh;q=0.9"}})
 
     def _close_tab(self, tab_id):
         try:
@@ -589,6 +618,9 @@ class Browser:
         key = str(aweme.get("aweme_id") or aweme_id or "")
         if key:
             self._cache[key] = aweme
+            # 主页抓 200 个作品时，每条详情几十 KB，不封顶就是几十 MB 常驻内存
+            while len(self._cache) > 200:
+                self._cache.pop(next(iter(self._cache)), None)
         return aweme
 
     def _capture(self, ws, url, aweme_id, timeout):
@@ -646,9 +678,7 @@ class Browser:
             if method == "Network.responseReceived":
                 resp = msg.get("params", {}).get("response", {})
                 u = resp.get("url", "")
-                if any(k in u for k in ("aweme/v1/web/aweme/detail",
-                                        "aweme/v1/web/note/detail",
-                                        "/web/slides/")):
+                if spec.is_detail_url(u):
                     msg_id += 1
                     pending[msg_id] = True
                     ws.send({"id": msg_id, "method": "Network.getResponseBody",
@@ -657,22 +687,24 @@ class Browser:
             if msg.get("id") in pending:
                 pending.pop(msg["id"], None)
                 body = (msg.get("result") or {}).get("body")
-                if not body or "aweme_detail" not in body:
+                # 便宜的预筛：连 id 字样都没有，不值得 json.loads
+                if not spec.body_might_contain_aweme(body):
                     continue
                 try:
                     data = json.loads(body)
                 except Exception:
                     continue
-                aweme = data.get("aweme_detail")
+                aweme = spec.find_aweme(data, target_id)
                 if aweme:
                     # 首页推荐流也会发 detail 请求，别把别人的视频当成你的
-                    if target_id and str(aweme.get("aweme_id") or "") != target_id:
+                    if target_id and spec.aweme_id_of(aweme) != str(target_id):
                         continue
                     return aweme
-                filter_detail = data.get("filter_detail") or {}
-                reason = filter_detail.get("detail_msg") or filter_detail.get("notice") or ""
-                raise BrowserError("抖音没有返回这个作品的数据%s" %
-                                   ("：" + reason if reason else "（可能已删除、设为私密，或需要登录）"))
+                # 抖音给了明确原因就直接报；只是结构对不上就再等等后续响应，
+                # 免得一次格式微调就把「稍后能成功」误判成失败
+                reason = spec.find_block_reason(data)
+                if reason:
+                    raise BrowserError("抖音没有返回这个作品的数据：" + reason)
 
         hint = ""
         try:
@@ -691,11 +723,13 @@ class Browser:
     def _collect_links(self, ws, url, limit, timeout):
         ws.send({"id": 1, "method": "Page.enable"})
         ws.send({"id": 2, "method": "Page.navigate", "params": {"url": url}})
+        # 选择器写在 spec.py 里，主页改版时只改那一处
         js = ("(function(){window.scrollTo(0,document.body.scrollHeight);"
-              "var a=document.querySelectorAll('a[href*=\"/video/\"]');"
+              "var a=document.querySelectorAll(%s);"
               "var out=[];for(var i=0;i<a.length;i++){out.push(a[i].href);}"
-              "return out.join('\\n');})()")
+              "return out.join('\\n');})()" % json.dumps(spec.PROFILE_LINK_SELECTOR))
         links = []
+        seen = set()
         deadline = time.time() + timeout
         idle = 0
         last = 0
@@ -705,12 +739,14 @@ class Browser:
                 raw = self._eval_on(ws, js, timeout=5) or ""
                 before = len(links)
                 for line in raw.split("\n"):
-                    m = re.search(r"/video/(\d{15,25})", line)
+                    m = spec.PROFILE_ID_RE.search(line)
                     if not m:
                         continue
-                    u = "https://www.douyin.com/video/" + m.group(1)
-                    if u not in links:
-                        links.append(u)
+                    kind, aid = m.group(1), m.group(2)
+                    if aid in seen:
+                        continue
+                    seen.add(aid)
+                    links.append("https://www.douyin.com/%s/%s" % (kind, aid))
                 idle = idle + 1 if len(links) == before else 0
                 if len(links) >= limit or idle >= 4:
                     break
@@ -747,24 +783,31 @@ def pick_media(aweme, watermark=False, quality="auto", prefer_h264=True):
     """
     返回 (url, 宽, 高, 预计大小, 说明)。
     无水印 → video.bit_rate 里挑清晰度；带水印 → video.download_addr（抖音官方那一版）。
+
+    字段名一律走 spec.py 的候选表：抖音把 bit_rate 改名成 bitRateList，
+    或者把 play_addr 换成 playAddr，这里不用改代码就能继续取到地址。
     """
     video = aweme.get("video") or {}
     if watermark:
-        addr = video.get("download_addr") or {}
-        urls = addr.get("url_list") or []
+        addr = spec.first_value(video, spec.DOWNLOAD_ADDR_KEYS, {}) or {}
+        urls = spec.url_list(addr)
         if not urls:
             raise BrowserError("这个作品没有带水印的下载地址，换成无水印试试")
         return urls[0], addr.get("width"), addr.get("height"), addr.get("data_size"), "官方带水印"
 
     gears = []
-    for g in (video.get("bit_rate") or []):
-        addr = g.get("play_addr") or {}
-        if not addr.get("url_list"):
+    for g in (spec.first_value(video, spec.BITRATE_LIST_KEYS, []) or []):
+        if not isinstance(g, dict):
+            continue
+        addr = spec.first_value(g, spec.PLAY_ADDR_KEYS, {}) or {}
+        urls = spec.url_list(addr)
+        if not urls:
             continue
         gears.append({
             "res": _nominal(addr),
-            "h265": bool(g.get("is_h265") or g.get("is_bytevc1")),
+            "h265": spec.has_h265(g),
             "addr": addr,
+            "url": urls[0],
         })
     # 分辨率优先，同分辨率优先 H.264（兼容性更好）
     gears.sort(key=lambda g: (g["res"], 0 if g["h265"] else 1), reverse=True)
@@ -789,11 +832,11 @@ def pick_media(aweme, watermark=False, quality="auto", prefer_h264=True):
 
     if picked:
         addr = picked["addr"]
-        return (addr["url_list"][0], addr.get("width"), addr.get("height"),
+        return (picked["url"], addr.get("width"), addr.get("height"),
                 addr.get("data_size"), "%dP%s" % (picked["res"], " H.265" if picked["h265"] else ""))
 
-    addr = video.get("play_addr") or {}
-    urls = addr.get("url_list") or []
+    addr = spec.first_value(video, spec.PLAY_ADDR_KEYS, {}) or {}
+    urls = spec.url_list(addr)
     if not urls:
         raise BrowserError("没有找到可下载的视频地址")
     return urls[0], addr.get("width"), addr.get("height"), addr.get("data_size"), "原画"
@@ -814,10 +857,12 @@ def describe(aweme, watermark=False, quality="auto", prefer_h264=True):
     desc = (aweme.get("desc") or "").strip()
     video = aweme.get("video") or {}
     duration = int(video.get("duration") or aweme.get("duration") or 0)
-    cover_list = (video.get("cover") or {}).get("url_list") or []
+    cover_list = spec.url_list(spec.first_value(video, spec.COVER_KEYS, {}))
     stat = aweme.get("statistics") or {}
     images = aweme.get("images") or []
     aweme_id = str(aweme.get("aweme_id") or "")
+    music = aweme.get("music") or {}
+    music_urls = spec.url_list(spec.first_value(music, spec.MUSIC_PLAY_KEYS, {}))
 
     base = "%s-%s" % (safe_name(author, 20), short_desc(desc))
     info = {
@@ -838,8 +883,8 @@ def describe(aweme, watermark=False, quality="auto", prefer_h264=True):
         "image_count": len(images),
         "cover_url": cover_list[0] if cover_list else None,
         "base": base,
-        "music": (((aweme.get("music") or {}).get("play_url") or {}).get("url_list") or [None])[0],
-        "music_title": (aweme.get("music") or {}).get("title") or "",
+        "music": music_urls[0] if music_urls else None,
+        "music_title": music.get("title") or "",
     }
 
     if images:
@@ -879,13 +924,20 @@ HEADERS = {
 def download_stream(url, path, on_progress=None, timeout=60, headers=None):
     """把 url 下载到 path。
 
-    下载中断（断网、服务器提前断开）时抛 BrowserError，并把半截文件删掉，
-    避免留下一个「看起来下载成功、其实放不了」的坏文件。
+    先写 ``path.part``，全部校验通过后再 ``os.replace`` 成 path。这样做是为了两件事：
+
+    1. 进程被强杀（关窗口、任务管理器、断电）时留下的是 ``.part``，
+       不会有一个「看起来下载成功、其实放不了」的半截 mp4；
+    2. 网页版是每个任务一个线程，两个任务万一拿到同一个路径，
+       各写各的 ``.part`` 再原子改名，不会交错写坏同一个文件。
+
+    下载中断（断网、服务器提前断开）时抛 BrowserError，并把半截文件删掉。
     """
     req = urllib.request.Request(url, headers=headers or HEADERS)
+    part = path + ".part"
     got = 0
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r, open(path, "wb") as f:
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(part, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             while True:
                 chunk = r.read(1 << 16)
@@ -901,47 +953,107 @@ def download_stream(url, path, on_progress=None, timeout=60, headers=None):
         if total and got != total:
             raise BrowserError("下载不完整：只拿到 %d / %d 字节，已删除半截文件，请重试"
                                % (got, total))
+        os.replace(part, path)
         return got
     except BaseException:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        _discard(part)
+        _discard_if_empty(path)
         raise
 
 
+def _discard(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _discard_if_empty(path):
+    """只删 0 字节的占位文件，绝不碰有内容的东西（可能是别人的）。"""
+    try:
+        if os.path.getsize(path) == 0:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def download_with_retry(url, path, attempts=3, on_progress=None, timeout=60):
+    """断网 / 服务器提前断开时再试几次。
+
+    每次都从头下（抖音的 CDN 不是都支持 Range），所以只在 BrowserError
+    （内容不完整、空响应）上重试；404 / 403 这类明确失败立刻抛出，不浪费次数。
+    """
+    last = None
+    for i in range(max(1, attempts)):
+        try:
+            return download_stream(url, path, on_progress=on_progress, timeout=timeout)
+        except BrowserError as e:
+            last = e
+            if i + 1 < attempts:
+                time.sleep(1.5 * (i + 1))
+    raise last
+
+
 def unique_path(folder, base, ext):
-    path = os.path.join(folder, "%s.%s" % (base, ext))
-    n = 1
-    while os.path.exists(path):
-        path = os.path.join(folder, "%s(%d).%s" % (base, n, ext))
-        n += 1
-    return path
+    """占一个不重名的路径，并且**真的把它创建出来**（0 字节）。
+
+    为什么必须创建：网页版是每个任务一个线程并发下载的，只做
+    ``os.path.exists`` 判断的话，两个线程会同时拿到同一个路径，
+    互相覆盖对方的文件；其中一个失败时还会把另一个正在写的文件删掉。
+    ``O_CREAT | O_EXCL`` 是原子操作，抢不到就换下一个编号，撞不了。
+    """
+    n = 0
+    while True:
+        name = "%s.%s" % (base, ext) if not n else "%s(%d).%s" % (base, n, ext)
+        path = os.path.join(folder, name)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            n += 1
+            continue
+        os.close(fd)
+        return path
 
 
-def download_gallery(urls, folder, base, on_progress=None):
-    """图集：逐张下下来打包成 zip。"""
+def download_gallery(urls, folder, base, on_progress=None, on_failure=None):
+    """图集：逐张下下来打包成 zip。
+
+    单张失败不中断（抖音的图偶尔会 403 一两次，重下通常就好），但**必须报出来**：
+    以前是静默 ``continue``，用户拿到一个只有一半图的 zip 还以为完整。
+    ``on_failure(第几张, 地址, 异常)`` 会被逐个调用，调用方据此提示或记录。
+    """
     path = unique_path(folder, base, "zip")
+    part = path + ".part"
     tmpdir = tempfile.mkdtemp(prefix="dydl_img_")
     try:
         files = []
         for idx, u in enumerate(urls, 1):
-            if not u:
-                continue
             target = os.path.join(tmpdir, "%02d.jpg" % idx)
             try:
+                if not u:
+                    raise BrowserError("这一张没有可用地址")
                 download_stream(u, target, timeout=45)
                 files.append(target)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                if on_failure:
+                    try:
+                        on_failure(idx, u, e)
+                    except Exception:
+                        pass
                 continue
             if on_progress:
                 on_progress(idx, len(urls))
         if not files:
             raise BrowserError("图集下载失败，一张图都没拿到")
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+        with zipfile.ZipFile(part, "w", zipfile.ZIP_STORED) as zf:
             for f in files:
                 zf.write(f, os.path.basename(f))
+        os.replace(part, path)
         return path
+    except BaseException:
+        _discard(part)
+        _discard_if_empty(path)
+        raise
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1051,11 +1163,17 @@ def find_ffmpeg(extra=None):
     return None
 
 
-def extract_mp3(video_path, out_path, ffmpeg, bitrate="192k"):
+def extract_mp3(video_path, out_path, ffmpeg, bitrate="192k", timeout=180):
+    """抽音轨。ffmpeg 卡住时必须能放弃，否则整个下载线程会永久挂死。"""
     creationflags = 0x08000000 if sys.platform == "win32" else 0
-    proc = subprocess.run(
-        [ffmpeg, "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", bitrate, out_path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creationflags)
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", bitrate, out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creationflags,
+            timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _discard_if_empty(out_path)
+        raise BrowserError("ffmpeg 超过 %d 秒还没结束，已放弃（视频文件可能损坏）" % timeout)
     if proc.returncode != 0 or not os.path.exists(out_path):
         raise BrowserError("ffmpeg 转换失败：%s" % proc.stderr.decode("utf-8", "ignore")[-160:])
     return out_path

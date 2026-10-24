@@ -16,8 +16,10 @@ import os
 import socket
 import sys
 import time
+import urllib.request
 
 import core
+import spec
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -242,8 +244,12 @@ def download_versions(info, versions, folder, ffmpeg, save_audio):
     saved = []
     if info["kind"] == "gallery":
         prog = Progress("图集")
+
+        def on_fail(idx, url, err):
+            print("  %s 第 %d 张没下到：%s" % (c("!", "33"), idx, str(err)[:60]))
+
         path = core.download_gallery(info["files"], folder, info["filename"]["nowm"],
-                                     on_progress=prog)
+                                     on_progress=prog, on_failure=on_fail)
         print("  %s %s" % (c("✓", "32"), os.path.basename(path)))
         return [path]
 
@@ -253,7 +259,8 @@ def download_versions(info, versions, folder, ffmpeg, save_audio):
         prog = Progress("带水印" if wm else "无水印")
         path = core.unique_path(folder, info["filename"][tag], "mp4")
         try:
-            core.download_stream(meta["url"], path, on_progress=prog)
+            # 断网 / 半截响应自动重试，别让一次抖动毁掉整个任务
+            core.download_with_retry(meta["url"], path, on_progress=prog)
         except Exception as e:  # noqa: BLE001
             print("\r  %s 下载失败：%s" % (c("✗", "31"), e))
             continue
@@ -303,8 +310,9 @@ def run(args):
         cfg["save_meta"] = False
     if args.meta:
         cfg["save_meta"] = True
-    if args.max:
-        cfg["profile_limit"] = args.max
+    if args.max is not None:
+        # 用 `is not None` 而不是真值判断：--max 0 以前会被悄悄吞掉
+        cfg["profile_limit"] = max(1, args.max)
     folder = os.path.abspath(core.config_output_dir(BASE_DIR, cfg, args.out))
     os.makedirs(folder, exist_ok=True)
 
@@ -457,7 +465,133 @@ def check_env(args):
     else:
         print(c("  必需依赖齐全，可以直接用。", "92"))
     print()
+    # 退出码要能反映结果：脚本 / CI 靠它判断，只有 0 和 1 两种
     return 1 if issues else 0
+
+
+# --------------------------------------------------------------------------- #
+# 端到端自检
+# --------------------------------------------------------------------------- #
+SELFTEST_ENV = "DYDL_SELFTEST_AWEME"
+
+
+def self_test(args):
+    """真跑一遍完整链路，确认「抖音这条路现在还能走」。
+
+    退出码 0 = 全过，1 = 有失败。CI 的每日定时任务靠这个判断要不要告警。
+
+    失败提示会指向 spec.py 里该改的常量 —— 抖音改版时改那里就够了，
+    不用重新读一遍 core.py。
+    """
+    print()
+    line()
+    print("  端到端自检：真实访问抖音，验证接口契约还有效")
+    line()
+
+    cfg = load_config()
+    sample = (args.selftest if isinstance(args.selftest, str) else "")
+    sample = (sample or os.environ.get(SELFTEST_ENV)
+              or cfg.get("selftest_aweme") or "").strip()
+
+    failures = []
+
+    def ok(msg, extra=""):
+        print("  %s %s%s" % (c("[通过] ", "92"), msg, ("   " + extra) if extra else ""))
+
+    def bad(msg, hint=""):
+        print("  %s %s" % (c("[失败] ", "91"), msg))
+        if hint:
+            print("         %s" % c(hint, "90"))
+        failures.append(msg)
+
+    def skip(msg):
+        print("  %s %s" % (c("[跳过] ", "93"), msg))
+
+    browser_path = core.find_browser()
+    if not browser_path:
+        bad("没找到 Edge / Chrome", "先装浏览器；完整依赖检查见 --checkenv")
+        line()
+        return 1
+    ok("浏览器", browser_path)
+
+    if not sample:
+        bad("还没设置自检样片",
+            "找一条长期存在的公开视频，跑：python app.py --selftest <链接>\n"
+            "         程序会把这条记进 config.json，以后直接 --selftest 就行。\n"
+            "         也可以设环境变量 %s 给 CI 用。" % SELFTEST_ENV)
+        line()
+        return 1
+
+    url = core.normalize_url(sample)
+    aweme_id = core.extract_aweme_id(url)
+    ok("样片", "%s" % url)
+
+    browser = core.Browser(log=lambda m: None)
+    atexit.register(browser.close)
+
+    try:
+        browser.start()
+    except Exception as e:
+        bad("无头浏览器起不来：%s" % e, "换个浏览器，或跑 --cleanup 清掉残留进程")
+        line()
+        return 1
+    ok("无头浏览器启动，已预热拿到 ttwid")
+
+    try:
+        aweme = browser.detail(url)
+    except core.BrowserError as e:
+        bad("解析失败：%s" % e,
+            "若提示「解析超时」，多半是改版了：\n"
+            "         接口路径没截到 → spec.DETAIL_URL_RE\n"
+            "         截到了但取不出数据 → spec.DETAIL_WRAPPER_KEYS")
+        line()
+        return 1
+
+    got_id = spec.aweme_id_of(aweme)
+    ok("详情接口截包成功", "aweme_id=%s" % (got_id or "未识别"))
+    if aweme_id and got_id and aweme_id != got_id:
+        bad("返回的作品和请求的不是同一条", "可能被风控改写了响应，或者样片已失效")
+
+    media_url = None
+    try:
+        media_url, w, h, size, label = core.pick_media(aweme)
+        ok("媒体字段", "%s  %sx%s" % (label, w or "?", h or "?"))
+    except Exception as e:
+        bad("媒体字段失配：%s" % e,
+            "改 spec.BITRATE_LIST_KEYS / PLAY_ADDR_KEYS / URL_LIST_KEYS")
+
+    try:
+        wm_url = core.pick_media(aweme, watermark=True)[0]
+        ok("带水印地址", wm_url.split("?")[0][-40:])
+    except Exception:
+        skip("带水印地址：这条样片没有（不影响无水印）")
+
+    if media_url:
+        try:
+            req = urllib.request.Request(media_url,
+                                         headers=dict(core.HEADERS, Range="bytes=0-1"))
+            with urllib.request.urlopen(req, timeout=15) as r:
+                code = getattr(r, "status", 200) or 200
+            ok("视频地址可下载", "HTTP %d" % code)
+        except Exception as e:
+            bad("视频地址取不到：%s" % e, "地址过期，或 CDN 域名换了")
+
+    canonical = ("https://www.douyin.com/video/%s" % got_id) if got_id else url
+    if canonical != (cfg.get("selftest_aweme") or ""):
+        cfg["selftest_aweme"] = canonical
+        try:
+            core.save_config(CONFIG_PATH, cfg)
+            print("  %s 样片已记进 config.json：%s" % (c("[记录] ", "90"), canonical))
+        except Exception:
+            pass
+
+    line()
+    if failures:
+        print(c("  自检失败 %d 项。上面标了该动 spec.py 哪一段。" % len(failures), "91"))
+        return 1
+    print(c("  全部通过：抖音这条路现在能用。", "92"))
+    print()
+    return 0
 
 
 def main():
@@ -483,10 +617,16 @@ def main():
                         help="清理上次被强杀后残留的无头浏览器，然后退出")
     parser.add_argument("--checkenv", action="store_true",
                         help="检查运行依赖（Python / 浏览器 / ffmpeg / 网络），然后退出")
+    parser.add_argument("--selftest", nargs="?", const=True, metavar="链接",
+                        help="端到端自检：用一条真实作品验证抖音接口还能不能用，"
+                             "首次可带上链接，之后会自动记住")
     args = parser.parse_args()
 
     if args.checkenv:
         return check_env(args)
+
+    if args.selftest:
+        return self_test(args)
 
     if args.cleanup:
         core.kill_stale_browser()
